@@ -7,9 +7,12 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from database import DatabaseManager
-from bridge_service import BridgeService
+from core.database import get_database_manager
+from core.bridge_service import BridgeService
+from services.f2f_client import F2FClient
+from services.campaign_service import CampaignService
 from cogs.owner_commands import OwnerCommands
+from cogs.f2f_automation import F2FAutomation
 
 # Configure Logging
 logging.basicConfig(
@@ -33,13 +36,17 @@ if not TOKEN or TOKEN == "YOUR_DISCORD_BOT_TOKEN_HERE":
 intents = discord.Intents.default()
 intents.guilds = True
 intents.messages = True
-intents.message_content = True  # Required for reading message content to relay
+intents.message_content = True  # Required for reading message content to relay & prompt
 
 class ChatBridgeBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents, help_command=None)
-        self.db = DatabaseManager()
+        self.db = get_database_manager()
         self.bridge_service = BridgeService(self, self.db)
+        
+        # Initialize F2F Client & Campaign Service
+        self.f2f_client = F2FClient()
+        self.campaign_service = CampaignService(self.db, self.f2f_client)
 
     async def setup_hook(self):
         logger.info("Initializing Database connection...")
@@ -48,8 +55,9 @@ class ChatBridgeBot(commands.Bot):
         logger.info("Loading Bridge Service Cache...")
         await self.bridge_service.reload_cache()
 
-        logger.info("Adding Cog: OwnerCommands...")
+        logger.info("Adding Cogs: OwnerCommands & F2FAutomation...")
         await self.add_cog(OwnerCommands(self, self.bridge_service))
+        await self.add_cog(F2FAutomation(self, self.campaign_service))
 
         logger.info("Syncing Slash Command Tree with Discord...")
         try:
@@ -62,7 +70,7 @@ class ChatBridgeBot(commands.Bot):
         logger.info(f"Logged in as {self.user.name}#{self.user.discriminator} (ID: {self.user.id})")
         logger.info(f"Connected to {len(self.guilds)} Guilds.")
         await self.change_presence(
-            activity=discord.Activity(type=discord.ActivityType.watching, name="2-Way Channel Sync")
+            activity=discord.Activity(type=discord.ActivityType.watching, name="Channel Sync & F2F Automation")
         )
 
     async def on_message(self, message: discord.Message):
@@ -81,9 +89,10 @@ class ChatBridgeBot(commands.Bot):
     async def close(self):
         logger.info("Shutting down ChatBridge bot...")
         try:
+            await self.f2f_client.close()
             await self.db.close()
         except Exception as e:
-            logger.error(f"Error closing database: {e}")
+            logger.error(f"Error during cleanup: {e}")
         await super().close()
 
 async def main():
@@ -114,6 +123,12 @@ async def main():
 
         for task in pending:
             task.cancel()
+
+        if bot_task in done:
+            exc = bot_task.exception()
+            if exc:
+                logger.error(f"Bot startup failed with error: {exc}")
+                raise exc
 
         if stop_event.is_set():
             await bot.close()

@@ -3,9 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Environment variables & credentials
+# Environment variables & credentials (CRITICAL - DO NOT COMMIT)
 .env
-.env.local
+.env.*
+*.env
 
 # Virtual Environments
 .venv/
@@ -13,13 +14,20 @@ venv/
 env/
 ENV/
 
-# Database files
+# Database files, dumps & reports
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
 *.sqlite
 *.sqlite3
+chatbridge_backup.json
+f2f_online_chats_report.json
+*.json
+
+# Temporary scratch scripts & testing output
+scratch/
+/.tempmediaStorage/
 
 # IDEs & Editor configs
 .idea/
@@ -32,5 +40,10 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Logs
+# Logs & Archives
 *.log
+*.zip
+
+# Local Agent instructions
+/.agent
+/.agents
