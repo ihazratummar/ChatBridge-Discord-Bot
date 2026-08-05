@@ -15,9 +15,9 @@ class OwnerCommands(commands.Cog):
     @app_commands.describe(channel1="First Discord Channel", channel2="Second Discord Channel")
     @app_commands.checks.has_permissions(administrator=True)
     async def setup_sync(self, interaction: discord.Interaction, channel1: discord.TextChannel, channel2: discord.TextChannel):
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         if channel1.id == channel2.id:
-            await interaction.followup.send("❌ Cannot sync a channel with itself!")
+            await interaction.followup.send("❌ Cannot sync a channel with itself!", ephemeral=True)
             return
 
         grp_id = f"grp_{channel1.id}_{channel2.id}"
@@ -26,16 +26,16 @@ class OwnerCommands(commands.Cog):
         await self.bridge_service.db.add_or_update_member(grp_id, channel2.id, mode="bidirectional")
 
         await self.bridge_service.reload_cache()
-        await interaction.followup.send(f"✅ **2-Way Sync Created** between {channel1.mention} and {channel2.mention}!")
+        await interaction.followup.send(f"✅ **2-Way Sync Created** between {channel1.mention} and {channel2.mention}!", ephemeral=True)
 
     @app_commands.command(name="bridge-create", description="Create a new named multi-channel bridge group.")
     @app_commands.describe(group_name="Name for the bridge group (e.g. Creator-Mesh)")
     @app_commands.checks.has_permissions(administrator=True)
     async def bridge_create(self, interaction: discord.Interaction, group_name: str):
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         grp_id = await self.bridge_service.db.create_group(name=group_name)
         await self.bridge_service.reload_cache()
-        await interaction.followup.send(f"✅ **Created Bridge Group**: **{group_name}** (`{grp_id}`)")
+        await interaction.followup.send(f"✅ **Created Bridge Group**: **{group_name}** (`{grp_id}`)", ephemeral=True)
 
     @app_commands.command(name="bridge-add", description="Add a channel to a bridge group with routing mode.")
     @app_commands.describe(
@@ -51,7 +51,7 @@ class OwnerCommands(commands.Cog):
     ])
     @app_commands.checks.has_permissions(administrator=True)
     async def bridge_add(self, interaction: discord.Interaction, group_id: str, channel: discord.TextChannel, mode: app_commands.Choice[str], bot_name: str | None = None):
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         await self.bridge_service.db.add_or_update_member(
             group_id=group_id,
             channel_id=channel.id,
@@ -59,13 +59,13 @@ class OwnerCommands(commands.Cog):
             bot_name=bot_name or "ChatBridge Bot"
         )
         await self.bridge_service.reload_cache()
-        await interaction.followup.send(f"✅ Added {channel.mention} to group `{group_id}` in **{mode.name}** mode!")
+        await interaction.followup.send(f"✅ Added {channel.mention} to group `{group_id}` in **{mode.name}** mode!", ephemeral=True)
 
     @app_commands.command(name="bridge-remove", description="Remove a channel from a bridge group or all groups.")
     @app_commands.describe(channel="Discord Text Channel to remove", group_id="Specific Group ID (optional, leave blank to remove from all)")
     @app_commands.checks.has_permissions(administrator=True)
     async def bridge_remove(self, interaction: discord.Interaction, channel: discord.TextChannel, group_id: str | None = None):
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         if group_id:
             removed = await self.bridge_service.db.remove_member(group_id, channel.id)
             msg = f"✅ Removed {channel.mention} from group `{group_id}`." if removed else "❌ Channel was not in specified group."
@@ -74,27 +74,27 @@ class OwnerCommands(commands.Cog):
             msg = f"✅ Removed {channel.mention} from **{count}** bridge group(s)."
 
         await self.bridge_service.reload_cache()
-        await interaction.followup.send(msg)
+        await interaction.followup.send(msg, ephemeral=True)
 
     @app_commands.command(name="set-name", description="Set custom bot display name for a channel in bridge groups.")
     @app_commands.describe(channel="Target Channel", bot_name="Bot identity display name (e.g. Message Notifier)")
     @app_commands.checks.has_permissions(administrator=True)
     async def set_name(self, interaction: discord.Interaction, channel: discord.TextChannel, bot_name: str):
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         await self.bridge_service.db.update_member_config(channel_id=channel.id, bot_name=bot_name)
         await self.bridge_service.reload_cache()
-        await interaction.followup.send(f"✅ Updated bot identity display name for {channel.mention} to **\"{bot_name}\"**!")
+        await interaction.followup.send(f"✅ Updated bot identity display name for {channel.mention} to **\"{bot_name}\"**!", ephemeral=True)
 
     @app_commands.command(name="set-role", description="Set role ping ID triggered when messages arrive in a channel.")
     @app_commands.describe(channel="Target Channel", role="Role to ping when messages arrive (or leave blank to clear)")
     @app_commands.checks.has_permissions(administrator=True)
     async def set_role(self, interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role | None = None):
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         role_id_str = str(role.id) if role else None
         await self.bridge_service.db.update_member_config(channel_id=channel.id, role_id=role_id_str)
         await self.bridge_service.reload_cache()
         msg = f"✅ Set role ping for {channel.mention} to {role.mention}." if role else f"✅ Cleared role pings for {channel.mention}."
-        await interaction.followup.send(msg)
+        await interaction.followup.send(msg, ephemeral=True)
 
     @app_commands.command(name="sync-status", description="Check all active channel bridge sync groups.")
     async def sync_status(self, interaction: discord.Interaction):
@@ -106,4 +106,4 @@ class OwnerCommands(commands.Cog):
                 role_info = f" <@&{m['role_id']}>" if m.get("role_id") else ""
                 members_info.append(f"<#{m['channel_id']}> ({m.get('mode', 'bidirectional')}) [{m.get('bot_name', 'ChatBridge')}){role_info}")
             embed.add_field(name=f"Group: {g['name']} (`{g['id']}`)", value="\n".join(members_info) or "No channels", inline=False)
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)

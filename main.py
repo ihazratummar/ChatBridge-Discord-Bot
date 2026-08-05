@@ -69,6 +69,10 @@ class ChatBridgeBot(commands.Bot):
     async def on_ready(self):
         logger.info(f"Logged in as {self.user.name}#{self.user.discriminator} (ID: {self.user.id})")
         logger.info(f"Connected to {len(self.guilds)} Guilds.")
+
+        # Automatically start background campaign worker loops
+        self.campaign_service.start_worker()
+
         await self.change_presence(
             activity=discord.Activity(type=discord.ActivityType.watching, name="Channel Sync & F2F Automation")
         )
