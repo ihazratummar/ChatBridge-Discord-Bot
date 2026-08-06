@@ -144,7 +144,28 @@ class CampaignService:
                 {"$set": {"_id": "followup_text", "text": clean_text}},
                 upsert=True
             )
-            logger.info(f"Updated follow-up message template in MongoDB: '{clean_text}'")
+            logger.info(f"Updated follow-up message template in MongoDB Atlas.")
+            return True
+        return True
+
+    async def get_cooldown_hours(self) -> int:
+        """Retrieves configured cooldown window in hours from MongoDB (default 4h)."""
+        if hasattr(self.db, "db") and self.db.db is not None:
+            doc = await self.db.db.settings.find_one({"_id": "cooldown_hours"})
+            if doc and doc.get("hours"):
+                return int(doc.get("hours"))
+        return 4
+
+    async def set_cooldown_hours(self, hours: int) -> bool:
+        """Owner-only: Updates configured cooldown window in hours in MongoDB."""
+        new_hours = max(1, hours)
+        if hasattr(self.db, "db") and self.db.db is not None:
+            await self.db.db.settings.update_one(
+                {"_id": "cooldown_hours"},
+                {"$set": {"_id": "cooldown_hours", "hours": new_hours}},
+                upsert=True
+            )
+            logger.info(f"Updated cooldown window to {new_hours} hour(s) in MongoDB Atlas.")
             return True
         return True
 
@@ -180,6 +201,48 @@ class CampaignService:
             )
             return res.modified_count > 0
         return False
+
+    async def get_campaign_stats(self, creator: str | None = None) -> dict:
+        """Calculates live campaign statistics (sent today, sent this hour, total dispatches) from MongoDB."""
+        if not hasattr(self.db, "db") or self.db.db is None:
+            return {"sent_today": 0, "sent_this_hour": 0, "total_sent": 0, "replied_stop": 0}
+
+        now = datetime.utcnow()
+        one_hour_ago = now - timedelta(hours=1)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        query_base = {"creator": creator} if creator else {}
+
+        query_hour = {
+            **query_base,
+            "$or": [
+                {"initial_sent_at": {"$gte": one_hour_ago}},
+                {"followup_sent_at": {"$gte": one_hour_ago}}
+            ]
+        }
+        sent_this_hour = await self.db.db.campaign_user_states.count_documents(query_hour)
+
+        query_today = {
+            **query_base,
+            "$or": [
+                {"initial_sent_at": {"$gte": today_start}},
+                {"followup_sent_at": {"$gte": today_start}}
+            ]
+        }
+        sent_today = await self.db.db.campaign_user_states.count_documents(query_today)
+
+        query_replied = {**query_base, "status": "replied_stop"}
+        replied_stop = await self.db.db.campaign_user_states.count_documents(query_replied)
+
+        query_total = {**query_base, "status": {"$in": ["initial_sent", "followup_sent", "completed"]}}
+        total_sent = await self.db.db.campaign_user_states.count_documents(query_total)
+
+        return {
+            "sent_this_hour": sent_this_hour,
+            "sent_today": sent_today,
+            "replied_stop": replied_stop,
+            "total_sent": total_sent
+        }
 
     async def cancel_all_campaigns(self) -> int:
         """Cancels all active campaigns in MongoDB."""
@@ -261,10 +324,11 @@ class CampaignService:
                     "created_at": datetime.utcnow()
                 }
                 await self.db.db.campaign_runs.insert_one(doc)
+                cooldown_h = await self.get_cooldown_hours()
                 logger.info(f"🚀 Started continuous auto-rescanning campaign {cmp_id} for creator @{target_creator}.")
                 await self._notify_event(
                     "Continuous Outreach Loop Started",
-                    f"• Creator: **@{target_creator}**\n• Campaign ID: `{cmp_id}`\n• Initial Template:\n> *\"{raw_message[:150]}\"*\n• Polling: **Every 15s** with 4h cooldown.",
+                    f"• Creator: **@{target_creator}**\n• Campaign ID: `{cmp_id}`\n• Initial Template:\n> *\"{raw_message[:150]}\"*\n• Polling: **Every 15s** with {cooldown_h}h cooldown.",
                     level="success"
                 )
                 return cmp_id
@@ -341,12 +405,13 @@ class CampaignService:
 
         return False
 
-    async def is_fan_in_cooldown(self, chat_id: str, creator: str, cooldown_hours: int = 4, chat_obj: dict | None = None) -> bool:
+    async def is_fan_in_cooldown(self, chat_id: str, creator: str, cooldown_hours: int | None = None, chat_obj: dict | None = None) -> bool:
         """
-        Checks if fan has received any outgoing message (from bot or human chatter) within cooldown_hours (default 4h).
+        Checks if fan has received any outgoing message (from bot or human chatter) within cooldown_hours.
         Checks both MongoDB campaign records and live F2F chat's recent outgoing message timestamp!
         """
-        cutoff = datetime.utcnow() - timedelta(hours=cooldown_hours)
+        effective_hours = cooldown_hours if cooldown_hours is not None else await self.get_cooldown_hours()
+        cutoff = datetime.utcnow() - timedelta(hours=effective_hours)
 
         # 1. Check MongoDB Atlas Campaign States
         if hasattr(self.db, "db") and self.db.db is not None:
@@ -356,7 +421,7 @@ class CampaignService:
                 "initial_sent_at": {"$gte": cutoff}
             })
             if doc:
-                logger.info(f"🛡️ Fan '{chat_id}' is in {cooldown_hours}h cooldown based on MongoDB record (sent at {doc.get('initial_sent_at')}).")
+                logger.info(f"🛡️ Fan '{chat_id}' is in {effective_hours}h cooldown based on MongoDB record (sent at {doc.get('initial_sent_at')}).")
                 return True
 
         # 2. Check Live F2F Chat's Last Outgoing Message Timestamp (Supports human chatter sends)
@@ -376,7 +441,7 @@ class CampaignService:
                     dt_str = last_msg.get("datetime") or last_msg.get("created_at") or last_msg.get("created")
                     msg_dt = parse_f2f_datetime(dt_str)
                     if msg_dt and msg_dt >= cutoff:
-                        logger.info(f"🛡️ Fan '{chat_id}' is in {cooldown_hours}h cooldown based on live F2F message sent at {msg_dt} UTC.")
+                        logger.info(f"🛡️ Fan '{chat_id}' is in {effective_hours}h cooldown based on live F2F message sent at {msg_dt} UTC.")
                         return True
 
         return False
@@ -422,10 +487,11 @@ class CampaignService:
                 fan_name = details.get("title") or details.get("other_user", {}).get("username") or "Fan"
 
             if enforce_cooldown and await self.is_fan_in_cooldown(test_chat_id, target_creator):
-                logger.info(f"Test Cooldown Blocked: Fan '{fan_name}' ({test_chat_id}) is in 24h cooldown!")
+                cd_h = await self.get_cooldown_hours()
+                logger.info(f"Test Cooldown Blocked: Fan '{fan_name}' ({test_chat_id}) is in {cd_h}h cooldown!")
                 return {
                     "status": "cooldown_blocked",
-                    "reason": f"Fan '{fan_name}' is currently in 24-hour cooldown! Initial message skipped.",
+                    "reason": f"Fan '{fan_name}' is currently in {cd_h}-hour cooldown! Initial message skipped.",
                     "target_fan_name": fan_name
                 }
 
@@ -512,10 +578,21 @@ class CampaignService:
                 "Fan"
             )
 
+            is_creator_account = (
+                user_obj.get("is_creator") is True or
+                other_obj.get("is_creator") is True or
+                chat.get("is_creator") is True or
+                user_obj.get("account_type") == "creator" or
+                other_obj.get("account_type") == "creator"
+            )
+            if is_creator_account:
+                logger.info(f"🛡️ Skipping chat '{chat_id}' ({fan_name}): Target is another creator account!")
+                continue
+
             try:
-                # 4-Hour Active Cooldown Check (Prevents sending duplicate initial messages when new campaign is triggered)
+                # Active Cooldown Check (Prevents sending duplicate initial messages when new campaign is triggered)
                 if await self.is_fan_in_cooldown(chat_id, target_creator, chat_obj=chat):
-                    logger.info(f"Skipping fan '{fan_name}' ({chat_id}): Fan already messaged within 4h cooldown!")
+                    logger.info(f"Skipping fan '{fan_name}' ({chat_id}): Fan already messaged within active cooldown!")
                     skipped_replied += 1
                     continue
 
@@ -640,8 +717,19 @@ class CampaignService:
                 "Fan"
             )
 
+            is_creator_account = (
+                user_obj.get("is_creator") is True or
+                other_obj.get("is_creator") is True or
+                chat.get("is_creator") is True or
+                user_obj.get("account_type") == "creator" or
+                other_obj.get("account_type") == "creator"
+            )
+            if is_creator_account:
+                logger.info(f"🛡️ Skipping chat '{chat_id}' ({fan_name}): Target is another creator account!")
+                continue
+
             try:
-                # 1. 4-Hour Cooldown Check (Checks DB and live F2F message timestamp)
+                # 1. Active Cooldown Check (Checks DB and live F2F message timestamp)
                 if await self.is_fan_in_cooldown(chat_id, creator, chat_obj=chat):
                     continue
 

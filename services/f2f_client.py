@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import logging
 import asyncio
 import pyotp
@@ -20,8 +21,11 @@ class F2FClient:
         self.csrf_token = csrf_token or os.getenv("F2F_CSRF_TOKEN", "")
         self.session: AsyncSession | None = None
         self._global_send_lock = asyncio.Lock()
+        self._login_lock = asyncio.Lock()
         self._min_send_gap_seconds = 4.0  # Enforces 4s minimum spacing between ANY outgoing API calls across all creators!
         self._last_send_timestamp = 0.0
+        self._last_login_timestamp = 0.0
+        self._last_login_failed_at = 0.0
         self.event_callback = event_callback
 
     async def _notify_event(self, title: str, description: str, level: str = "info"):
@@ -74,131 +78,184 @@ class F2FClient:
 
     async def refresh_session(self) -> bool:
         """Autonomous 2FA login with step-by-step tracing and audit log dispatch to #f2f_logs."""
-        if not self.username or not self.password:
-            err_msg = "F2F_USERNAME or F2F_PASSWORD environment variable is missing."
-            logger.error(err_msg)
-            await self._notify_event("Login Failed: Credentials Missing", f"• Account: `{self.username or 'None'}`\n• Error: {err_msg}", level="error")
-            return False
+        async with self._login_lock:
+            now_ts = asyncio.get_event_loop().time()
 
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            await self._ensure_session()
-            logger.info(f"🔑 Step 1/4: Initiating autonomous login (Attempt {attempt}/{max_attempts}) for '{self.username}'...")
+            # Dedup: If another parallel task SUCCESSFULLY refreshed within 10s, skip
+            if (now_ts - self._last_login_timestamp) < 10.0 and self.session_id:
+                logger.info("⚡ F2F session was recently refreshed by a parallel task. Skipping duplicate login.")
+                return True
 
-            try:
-                # Step 1: GET /login/ to retrieve initial CSRF token
-                get_resp = await self.session.get("https://f2f.com/login/", headers=self._get_headers())
-                cookies = get_resp.cookies
-                if "csrftoken" in cookies:
-                    self.csrf_token = cookies["csrftoken"]
-                    logger.info(f"🔑 Step 1/4 Complete: Initial CSRF Token extracted ({self.csrf_token[:8]}...).")
-                else:
-                    logger.warning("Step 1/4 Warning: CSRF token not found on login page, proceeding...")
+            # Dedup: If a login just FAILED within 30s, don't hammer F2F again
+            if (now_ts - self._last_login_failed_at) < 30.0:
+                logger.warning("⚡ F2F login recently failed. Waiting 30s before retry to avoid rate limits.")
+                return False
 
-                # Step 2: Generate 2FA TOTP code
-                login_url = f"{BASE_URL}/auth/login/"
-                otp_code = None
-                if self.totp_secret:
-                    try:
+            if not self.username or not self.password:
+                err_msg = "F2F_USERNAME or F2F_PASSWORD environment variable is missing."
+                logger.error(err_msg)
+                await self._notify_event("Login Failed: Credentials Missing", f"• Account: `{self.username or 'None'}`\n• Error: {err_msg}", level="error")
+                return False
+
+            last_rejected_otp = None  # Track burned TOTP codes to avoid reuse
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                await self._ensure_session()
+                logger.info(f"🔑 Step 1/4: Initiating autonomous login (Attempt {attempt}/{max_attempts}) for '{self.username}'...")
+
+                try:
+                    # Step 1: GET /login/ to retrieve initial CSRF token
+                    get_resp = await self.session.get("https://f2f.com/login/", headers=self._get_headers())
+
+                    # Try resp.cookies first, then fall back to session cookie jar
+                    csrf_found = False
+                    if "csrftoken" in get_resp.cookies:
+                        self.csrf_token = get_resp.cookies["csrftoken"]
+                        csrf_found = True
+                    elif hasattr(self.session, "cookies") and "csrftoken" in self.session.cookies:
+                        self.csrf_token = self.session.cookies["csrftoken"]
+                        csrf_found = True
+
+                    if csrf_found:
+                        logger.info(f"🔑 Step 1/4 Complete: Initial CSRF Token extracted ({self.csrf_token[:8]}...).")
+                    else:
+                        logger.warning("Step 1/4 Warning: CSRF token not found on login page, proceeding...")
+
+                    # Step 2: Generate 2FA TOTP code (wait for fresh code if previous was rejected)
+                    login_url = f"{BASE_URL}/auth/login/"
+                    otp_code = None
+                    if self.totp_secret:
+                        try:
+                            totp = pyotp.TOTP(self.totp_secret)
+                            otp_code = totp.at(int(time.time()))  # UTC-safe, works on any timezone/VPS
+
+                            # If this code was already rejected by F2F, wait for TOTP window rotation
+                            if last_rejected_otp and otp_code == last_rejected_otp:
+                                logger.info(f"🔑 Step 2/4: TOTP code {otp_code} was already burned. Waiting for 30s window rotation...")
+                                for _ in range(35):  # Max 35 seconds wait
+                                    await asyncio.sleep(1)
+                                    otp_code = totp.at(int(time.time()))  # UTC-safe, works on any timezone/VPS
+                                    if otp_code != last_rejected_otp:
+                                        break
+                                if otp_code == last_rejected_otp:
+                                    logger.error("Step 2/4: TOTP window did not rotate after 35s. Aborting login.")
+                                    self._last_login_failed_at = asyncio.get_event_loop().time()
+                                    return False
+
+                            logger.info(f"🔑 Step 2/4: Generated fresh 2FA OTP code ({otp_code}) via pyotp.")
+                        except Exception as e:
+                            logger.warning(f"Step 2/4 Warning: Failed to generate pyotp TOTP code: {e}")
+                    else:
+                        logger.warning("Step 2/4 Warning: F2F_TOTP_SECRET missing in configuration.")
+
+                    payload = {
+                        "email": self.username,
+                        "username": self.username,
+                        "password": self.password
+                    }
+                    if otp_code:
+                        payload["otp_token"] = otp_code
+                        payload["code"] = otp_code
+
+                    # Step 3: POST /auth/login/
+                    logger.info(f"🔑 Step 3/4: Submitting authentication payload to {login_url}...")
+                    resp = await self.session.post(login_url, json=payload, headers=self._get_headers(), cookies=self._get_cookies())
+                    data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+
+                    if resp.status_code in (200, 202) and (data.get("requires_2fa") or "verify_login" in str(data)):
+                        logger.info("🔑 Step 3.5/4: Secondary 2FA verification required by F2F.")
+                        # Extract interim cookies from Step 3 login response BEFORE verify call
+                        self._extract_cookies_from_response(resp)
+
+                        if not self.totp_secret:
+                            err_msg = "F2F_TOTP_SECRET missing! Cannot auto-complete secondary 2FA."
+                            logger.error(err_msg)
+                            await self._notify_event("2FA Login Failed", f"• Account: `{self.username}`\n• Error: {err_msg}", level="error")
+                            self._last_login_failed_at = asyncio.get_event_loop().time()
+                            return False
+
                         totp = pyotp.TOTP(self.totp_secret)
-                        otp_code = totp.now()
-                        logger.info(f"🔑 Step 2/4: Generated 2FA OTP code ({otp_code}) via pyotp.")
-                    except Exception as e:
-                        logger.warning(f"Step 2/4 Warning: Failed to generate pyotp TOTP code: {e}")
-                else:
-                    logger.warning("Step 2/4 Warning: F2F_TOTP_SECRET missing in configuration.")
+                        otp_code = totp.at(int(time.time()))  # UTC-safe, works on any timezone/VPS
 
-                payload = {
-                    "email": self.username,
-                    "username": self.username,
-                    "password": self.password
-                }
-                if otp_code:
-                    payload["otp_token"] = otp_code
-                    payload["code"] = otp_code
+                        verify_url = f"{BASE_URL}/auth/verify_login/"
+                        verify_payload = {"code": otp_code}
 
-                # Step 3: POST /auth/login/
-                logger.info(f"🔑 Step 3/4: Submitting authentication payload to {login_url}...")
-                resp = await self.session.post(login_url, json=payload, headers=self._get_headers())
-                data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                        verify_resp = await self.session.post(verify_url, json=verify_payload, headers=self._get_headers(), cookies=self._get_cookies())
+                        if verify_resp.status_code == 200:
+                            self._extract_cookies_from_response(verify_resp)
+                            self._last_login_timestamp = asyncio.get_event_loop().time()
+                            logger.info("🎉 Step 4/4 Complete: Autonomous 2FA Login Successful!")
+                            await self._notify_event(
+                                "Autonomous F2F Session Refreshed",
+                                f"• Account: **{self.username}**\n• Status: Successfully logged in via 2FA TOTP!\n• Session ID: `{self.session_id[:10]}...`",
+                                level="success"
+                            )
+                            return True
+                        else:
+                            last_rejected_otp = otp_code
+                            if attempt < max_attempts:
+                                logger.warning(f"Secondary 2FA verification attempt {attempt} failed. Will retry with fresh TOTP...")
+                                continue
+                            err_msg = f"2FA verification failed (HTTP {verify_resp.status_code}): {verify_resp.text[:150]}"
+                            logger.error(err_msg)
+                            await self._notify_event("2FA Login Failed", f"• Account: `{self.username}`\n• Error: {err_msg}", level="error")
+                            self._last_login_failed_at = asyncio.get_event_loop().time()
+                            return False
 
-                if resp.status_code in (200, 202) and (data.get("requires_2fa") or "verify_login" in str(data)):
-                    logger.info("🔑 Step 3.5/4: Secondary 2FA verification required by F2F.")
-                    if not self.totp_secret:
-                        err_msg = "F2F_TOTP_SECRET missing! Cannot auto-complete secondary 2FA."
-                        logger.error(err_msg)
-                        await self._notify_event("2FA Login Failed", f"• Account: `{self.username}`\n• Error: {err_msg}", level="error")
-                        return False
-
-                    totp = pyotp.TOTP(self.totp_secret)
-                    otp_code = totp.now()
-
-                    verify_url = f"{BASE_URL}/auth/verify_login/"
-                    verify_payload = {"code": otp_code}
-
-                    verify_resp = await self.session.post(verify_url, json=verify_payload, headers=self._get_headers())
-                    if verify_resp.status_code == 200:
-                        self._extract_cookies_from_response(verify_resp)
-                        logger.info("🎉 Step 4/4 Complete: Autonomous 2FA Login Successful!")
+                    elif resp.status_code == 200:
+                        self._extract_cookies_from_response(resp)
+                        self._last_login_timestamp = asyncio.get_event_loop().time()
+                        logger.info("🎉 Step 4/4 Complete: Autonomous Login Successful!")
                         await self._notify_event(
                             "Autonomous F2F Session Refreshed",
-                            f"• Account: **{self.username}**\n• Status: Successfully logged in via 2FA TOTP!\n• Session ID: `{self.session_id[:10]}...`",
+                            f"• Account: **{self.username}**\n• Status: Successfully logged into F2F!\n• Session ID: `{self.session_id[:10]}...`",
                             level="success"
                         )
                         return True
                     else:
-                        if attempt < max_attempts:
-                            logger.warning(f"Secondary 2FA verification attempt {attempt} failed. Retrying in 2s...")
-                            await asyncio.sleep(2)
-                            continue
-                        err_msg = f"2FA verification failed (HTTP {verify_resp.status_code}): {verify_resp.text[:150]}"
-                        logger.error(err_msg)
-                        await self._notify_event("2FA Login Failed", f"• Account: `{self.username}`\n• Error: {err_msg}", level="error")
-                        return False
+                        is_otp_boundary_err = "invalid-otp-token" in str(data).lower()
+                        if is_otp_boundary_err:
+                            last_rejected_otp = otp_code  # Mark this code as burned
+                            if attempt < max_attempts:
+                                logger.warning(f"🔑 TOTP code {otp_code} rejected on attempt {attempt}. Will wait for fresh TOTP window...")
+                                continue
 
-                elif resp.status_code == 200:
-                    self._extract_cookies_from_response(resp)
-                    logger.info("🎉 Step 4/4 Complete: Autonomous Login Successful!")
-                    await self._notify_event(
-                        "Autonomous F2F Session Refreshed",
-                        f"• Account: **{self.username}**\n• Status: Successfully logged into F2F!\n• Session ID: `{self.session_id[:10]}...`",
-                        level="success"
-                    )
-                    return True
-                else:
-                    is_otp_boundary_err = "invalid-otp-token" in str(data).lower()
-                    if is_otp_boundary_err and attempt < max_attempts:
-                        logger.warning(f"🔑 TOTP 30s window boundary mismatch on attempt {attempt}. Retrying with fresh TOTP token in 2s...")
+                        friendly_reason = self._format_friendly_error(resp.status_code, str(data))
+                        logger.error(f"Login failed (HTTP {resp.status_code}): {data}")
+                        await self._notify_event(
+                            "F2F Login Failed",
+                            f"• Account: `{self.username}`\n• Status Code: `HTTP {resp.status_code}`\n• Reason: {friendly_reason}",
+                            level="error"
+                        )
+                        self._last_login_failed_at = asyncio.get_event_loop().time()
+                        return False
+                except Exception as e:
+                    if attempt < max_attempts:
+                        logger.warning(f"Network exception on login attempt {attempt}: {e}. Retrying in 2s...")
                         await asyncio.sleep(2)
                         continue
-
-                    friendly_reason = self._format_friendly_error(resp.status_code, str(data))
-                    logger.error(f"Login failed (HTTP {resp.status_code}): {data}")
-                    await self._notify_event(
-                        "F2F Login Failed",
-                        f"• Account: `{self.username}`\n• Status Code: `HTTP {resp.status_code}`\n• Reason: {friendly_reason}",
-                        level="error"
-                    )
+                    err_msg = f"Network connection error during login: {e}"
+                    logger.error(err_msg, exc_info=True)
+                    await self._notify_event("F2F Login Network Error", f"• Account: `{self.username}`\n• Error: {err_msg}", level="error")
+                    self._last_login_failed_at = asyncio.get_event_loop().time()
                     return False
-            except Exception as e:
-                if attempt < max_attempts:
-                    logger.warning(f"Network exception on login attempt {attempt}: {e}. Retrying in 2s...")
-                    await asyncio.sleep(2)
-                    continue
-                err_msg = f"Network connection error during login: {e}"
-                logger.error(err_msg, exc_info=True)
-                await self._notify_event("F2F Login Network Error", f"• Account: `{self.username}`\n• Error: {err_msg}", level="error")
-                return False
 
+        self._last_login_failed_at = asyncio.get_event_loop().time()
         return False
 
     def _extract_cookies_from_response(self, resp):
         cookies = resp.cookies
+        updated = []
         if "sessionid" in cookies:
             self.session_id = cookies["sessionid"]
+            updated.append(f"Session ID: {self.session_id[:10]}...")
         if "csrftoken" in cookies:
             self.csrf_token = cookies["csrftoken"]
-        logger.info(f"Updated Session ID: {self.session_id[:10]}... | CSRF Token: {self.csrf_token[:10]}...")
+            updated.append(f"CSRF Token: {self.csrf_token[:10]}...")
+        if updated:
+            logger.info(f"🍪 Extracted cookies: {' | '.join(updated)}")
+        else:
+            logger.warning("⚠️ No sessionid or csrftoken found in response cookies.")
 
     async def get_online_chats(self, creator: str, max_pages: int = 10, auto_retry: bool = True) -> list[dict]:
         """Fetches all online chats for creator by traversing F2F API pagination cursor ('next')."""

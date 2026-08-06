@@ -156,6 +156,32 @@ class TestChatIDsModal(discord.ui.Modal, title="Edit Test Target Chat UUIDs"):
         await self.refresh_callback(interaction)
 
 
+class CooldownHoursModal(discord.ui.Modal, title="Edit Active Cooldown Window"):
+    hours_input = discord.ui.TextInput(
+        label="Cooldown Window (in hours)",
+        placeholder="e.g. 4",
+        default="4",
+        min_length=1,
+        max_length=4,
+        required=True
+    )
+
+    def __init__(self, campaign_service: CampaignService, refresh_callback):
+        super().__init__()
+        self.campaign_service = campaign_service
+        self.refresh_callback = refresh_callback
+
+    async def on_submit(self, interaction: discord.Interaction):
+        val = self.hours_input.value.strip()
+        if not val.isdigit() or int(val) < 1:
+            await interaction.response.send_message("❌ Cooldown must be a positive integer (e.g. 4).", ephemeral=True)
+            return
+
+        await self.campaign_service.set_cooldown_hours(int(val))
+        await interaction.response.send_message(f"✅ **Active Cooldown Window updated to {val} hour(s)!**", ephemeral=True)
+        await self.refresh_callback(interaction)
+
+
 class F2FConfigDashboardView(discord.ui.LayoutView):
     def __init__(self, campaign_service: CampaignService, author: discord.User | discord.Member):
         super().__init__(timeout=86400)
@@ -164,41 +190,88 @@ class F2FConfigDashboardView(discord.ui.LayoutView):
 
     async def build_dashboard_container(self) -> discord.ui.Container:
         gap = await self.campaign_service.get_followup_gap()
+        cooldown = await self.campaign_service.get_cooldown_hours()
         followup_txt = await self.campaign_service.get_followup_text()
         test_ids = await self.campaign_service.get_test_chat_ids()
         has_session = bool(self.campaign_service.f2f_client.session_id)
         has_totp = bool(self.campaign_service.f2f_client.totp_secret)
 
-        session_str = f"`{self.campaign_service.f2f_client.session_id[:10]}...`" if has_session else "❌ None"
-        totp_str = "✅ Configured" if has_totp else "❌ Not Configured"
+        session_str = f"🟢 Active (`{self.campaign_service.f2f_client.session_id[:10]}...`)" if has_session else "🔴 Disconnected"
+        totp_str = "🟢 Configured" if has_totp else "🔴 Missing"
 
-        test_ids_formatted = ", ".join([f"`{tid[:8]}...`" for tid in test_ids]) if test_ids else "❌ None"
+        test_ids_formatted = "\n".join([f"╰ `{tid}`" for tid in test_ids]) if test_ids else "╰ *None configured*"
 
-        text = (
-            "## ⚙️ F2F Automation Settings & Status\n"
-            f"• **Session Status**: {session_str}\n"
-            f"• **Autonomous 2FA (pyotp)**: {totp_str}\n"
-            f"• **Follow-Up Gap Interval**: `{gap} minute(s)`\n"
-            f"• **Active Test Target UUIDs**: {test_ids_formatted}\n"
-            f"• **Follow-Up Template**:\n> {followup_txt}\n\n"
-            "Use the buttons below to edit configuration parameters anytime."
-        )
+        # ── Header ──
+        container = discord.ui.Container(accent_color=discord.Color.from_str("#5865F2"))
 
-        container = discord.ui.Container(accent_color=discord.Color.blue())
-        container.add_item(discord.ui.TextDisplay(content=text))
+        container.add_item(discord.ui.TextDisplay(
+            content="# ⚙️ Control Panel"
+        ))
+        container.add_item(discord.ui.TextDisplay(
+            content="-# F2F Automation Configuration & System Status"
+        ))
 
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+        # ── Connection Status Section ──
+        container.add_item(discord.ui.TextDisplay(
+            content=(
+                "### 🔐 Connection Status\n"
+                f"**Session**  ›  {session_str}\n"
+                f"**2FA TOTP**  ›  {totp_str}"
+            )
+        ))
+
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+        # ── Campaign Parameters ──
+        container.add_item(discord.ui.TextDisplay(
+            content=(
+                "### 🎛️ Campaign Parameters\n"
+                f"╭ ⏱️ **Follow-Up Gap**  ›  `{gap}` min\n"
+                f"╰ 🛡️ **Cooldown Window**  ›  `{cooldown}` hr"
+            )
+        ))
+
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+        # ── Follow-Up Template ──
+        snippet = followup_txt[:120] + "..." if len(followup_txt) > 120 else followup_txt
+        container.add_item(discord.ui.TextDisplay(
+            content=(
+                "### 💬 Follow-Up Template\n"
+                f"> *{snippet}*"
+            )
+        ))
+
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+        # ── Test Targets ──
+        container.add_item(discord.ui.TextDisplay(
+            content=(
+                f"### 🎯 Test Targets ({len(test_ids)})\n"
+                f"{test_ids_formatted}"
+            )
+        ))
+
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+        # ── Action Buttons ──
         row1 = discord.ui.ActionRow()
-        btn_gap = discord.ui.Button(label="⏱️ Edit Follow-Up Gap", style=discord.ButtonStyle.primary, custom_id="cfg_gap")
-        btn_text = discord.ui.Button(label="📝 Edit Template Text", style=discord.ButtonStyle.primary, custom_id="cfg_text")
-        btn_test_ids = discord.ui.Button(label="🎯 Edit Test Target UUIDs", style=discord.ButtonStyle.secondary, custom_id="cfg_test_ids")
-        btn_refresh = discord.ui.Button(label="🔄 Refresh Dashboard", style=discord.ButtonStyle.secondary, custom_id="cfg_refresh")
+        btn_gap = discord.ui.Button(label="⏱️ Follow-Up Gap", style=discord.ButtonStyle.primary, custom_id="cfg_gap")
+        btn_cooldown = discord.ui.Button(label="🛡️ Cooldown", style=discord.ButtonStyle.primary, custom_id="cfg_cooldown")
+        btn_text = discord.ui.Button(label="💬 Template", style=discord.ButtonStyle.primary, custom_id="cfg_text")
+        btn_test_ids = discord.ui.Button(label="🎯 Test IDs", style=discord.ButtonStyle.secondary, custom_id="cfg_test_ids")
+        btn_refresh = discord.ui.Button(label="🔄", style=discord.ButtonStyle.secondary, custom_id="cfg_refresh")
 
         btn_gap.callback = self.edit_gap_callback
+        btn_cooldown.callback = self.edit_cooldown_callback
         btn_text.callback = self.edit_text_callback
         btn_test_ids.callback = self.edit_test_ids_callback
         btn_refresh.callback = self.refresh_callback
 
         row1.add_item(btn_gap)
+        row1.add_item(btn_cooldown)
         row1.add_item(btn_text)
         row1.add_item(btn_test_ids)
         row1.add_item(btn_refresh)
@@ -233,6 +306,12 @@ class F2FConfigDashboardView(discord.ui.LayoutView):
         modal.gap_input.default = str(gap)
         await interaction.response.send_modal(modal)
 
+    async def edit_cooldown_callback(self, interaction: discord.Interaction):
+        cooldown = await self.campaign_service.get_cooldown_hours()
+        modal = CooldownHoursModal(self.campaign_service, self.refresh_dashboard)
+        modal.hours_input.default = str(cooldown)
+        await interaction.response.send_modal(modal)
+
     async def edit_text_callback(self, interaction: discord.Interaction):
         txt = await self.campaign_service.get_followup_text()
         modal = FollowupTextModal(self.campaign_service, self.refresh_dashboard)
@@ -255,46 +334,83 @@ class CreatorSelect(discord.ui.Select):
     """Dropdown select menu for picking active creator models to cancel."""
     def __init__(self, creator_options: list[str]):
         options = [
-            discord.SelectOption(label=f"@{c}", value=c, description=f"Manage outreach campaigns for creator @{c}")
+            discord.SelectOption(label=f"@{c}", value=c, emoji="👤", description=f"Manage campaigns for @{c}")
             for c in creator_options
         ]
         if not options:
             options = [discord.SelectOption(label="No active creators", value="none")]
-        super().__init__(placeholder="Select a Creator Model to cancel...", min_values=1, max_values=1, options=options)
+        super().__init__(placeholder="👤  Select a creator to manage...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer()
 
 
 class F2FCampaignsDashboardView(discord.ui.LayoutView):
-    """Clean Components V2 Dashboard for managing and cancelling active creator campaigns."""
+    """Premium Components V2 Dashboard for managing and cancelling active creator campaigns."""
     def __init__(self, campaign_service: CampaignService, author: discord.User | discord.Member):
         super().__init__(timeout=86400)
         self.campaign_service = campaign_service
         self.author = author
         self.creator_select: CreatorSelect | None = None
 
+    def _make_bar(self, value: int, max_val: int, length: int = 10) -> str:
+        """Creates a clean Unicode progress bar."""
+        if max_val <= 0:
+            fill = 0
+        else:
+            fill = min(int((value / max_val) * length), length)
+        return "▓" * fill + "░" * (length - fill)
+
     async def build_campaigns_container(self) -> discord.ui.Container:
         active_cmp = await self.campaign_service.get_active_campaigns()
-        
+        global_stats = await self.campaign_service.get_campaign_stats()
+
+        sent_hour = global_stats['sent_this_hour']
+        sent_today = global_stats['sent_today']
+        replied = global_stats['replied_stop']
+        total_sent = global_stats['total_sent']
+
         if not active_cmp:
-            text = (
-                "## 🌐 F2F Active Campaigns Manager\n"
-                "No active outreach campaigns running right now.\n\n"
-                "All follow-up loops are stored persistently in **Cloud MongoDB Atlas** and survive bot & Discord restarts!"
-            )
-            container = discord.ui.Container(accent_color=discord.Color.blue())
-            container.add_item(discord.ui.TextDisplay(content=text))
+            # ── Empty State ──
+            container = discord.ui.Container(accent_color=discord.Color.from_str("#5865F2"))
+
+            container.add_item(discord.ui.TextDisplay(
+                content="# 📊 Campaign Dashboard"
+            ))
+            container.add_item(discord.ui.TextDisplay(
+                content="-# Real-time outreach monitoring & management"
+            ))
+
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+            # Stats even when no campaigns
+            container.add_item(discord.ui.TextDisplay(
+                content=(
+                    "### 📈 Lifetime Statistics\n"
+                    f"╭ 📨 **Total Sent**  ›  `{total_sent:,}`\n"
+                    f"╰ 💬 **Fan Replies**  ›  `{replied:,}`"
+                )
+            ))
+
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+            container.add_item(discord.ui.TextDisplay(
+                content=(
+                    "### 💤 No Active Campaigns\n"
+                    "*All outreach loops are currently idle.*\n"
+                    "-# Data persists in MongoDB Atlas across restarts"
+                )
+            ))
 
             action_row = discord.ui.ActionRow()
-            btn_refresh = discord.ui.Button(label="🔄 Refresh Active Campaigns", style=discord.ButtonStyle.secondary, custom_id="cmp_refresh")
+            btn_refresh = discord.ui.Button(label="🔄 Refresh", style=discord.ButtonStyle.primary, custom_id="cmp_refresh")
             btn_refresh.callback = self.refresh_callback
             action_row.add_item(btn_refresh)
-
             container.add_item(action_row)
             return container
 
-        # Group active campaigns by creator handle for clean summary!
+        # ── Active Dashboard ──
+        # Group active campaigns by creator
         creator_summary = {}
         for cmp in active_cmp:
             creator = cmp.get("creator", "unknown")
@@ -304,32 +420,70 @@ class F2FCampaignsDashboardView(discord.ui.LayoutView):
             creator_summary[creator]["loops"] += 1
             creator_summary[creator]["pending_fans"] += pending
 
-        lines = ["## 🌐 F2F Active Campaigns Manager\n*Stored in Cloud MongoDB Atlas — Persists across restarts!*\n"]
+        total_pending = sum(info["pending_fans"] for info in creator_summary.values())
+        total_creators = len(creator_summary)
+
+        container = discord.ui.Container(accent_color=discord.Color.from_str("#57F287"))
+
+        # ── Header ──
+        container.add_item(discord.ui.TextDisplay(
+            content="# 📊 Campaign Dashboard"
+        ))
+        container.add_item(discord.ui.TextDisplay(
+            content=f"-# {total_creators} active creator{'s' if total_creators != 1 else ''}  •  {total_pending:,} fans in queue  •  Updated <t:{int(datetime.utcnow().timestamp())}:R>"
+        ))
+
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+        # ── Live Stats Panel ──
+        # Build stat bars
+        bar_hour = self._make_bar(sent_hour, max(sent_today, 1))
+        bar_today = self._make_bar(sent_today, max(total_sent, 1))
+
+        container.add_item(discord.ui.TextDisplay(
+            content=(
+                "### 📈 Live Statistics\n"
+                f"**This Hour**   `{sent_hour:>5,}`  {bar_hour}\n"
+                f"**Today**       `{sent_today:>5,}`  {bar_today}\n"
+                f"**Replies**     `{replied:>5,}`  🛑\n"
+                f"**All Time**    `{total_sent:>5,}`  📦"
+            )
+        ))
+
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+        # ── Creator Cards ──
+        container.add_item(discord.ui.TextDisplay(
+            content="### 👥 Active Creators"
+        ))
+
         for creator, info in creator_summary.items():
             tpl = info["latest_template"]
-            snippet = f"\"{tpl[:40]}...\"" if len(tpl) > 40 else f"\"{tpl}\""
-            lines.append(
-                f"• **Creator @{creator}**: **{info['loops']}** active campaign loop(s) | "
-                f"Pending Fans: **{info['pending_fans']}**\n  > Prompt: *{snippet}*"
+            snippet = f"{tpl[:60]}..." if len(tpl) > 60 else tpl
+            loops = info["loops"]
+            pending = info["pending_fans"]
+
+            status_dot = "🟢" if pending > 0 else "🟡"
+            creator_card = (
+                f"{status_dot} **@{creator}**\n"
+                f"╭ 🔄 **Loops**: `{loops}`  ·  📬 **Queue**: `{pending:,}` fans\n"
+                f"╰ 💬 *\"{snippet}\"*"
             )
+            container.add_item(discord.ui.TextDisplay(content=creator_card))
 
-        lines.append("\nSelect a creator model from the dropdown below to cancel running outreach loops.")
-        dashboard_text = "\n".join(lines)
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
-        container = discord.ui.Container(accent_color=discord.Color.green())
-        container.add_item(discord.ui.TextDisplay(content=dashboard_text))
-
-        # Dropdown Action Row
+        # ── Dropdown ──
         dropdown_row = discord.ui.ActionRow()
         self.creator_select = CreatorSelect(list(creator_summary.keys()))
         dropdown_row.add_item(self.creator_select)
         container.add_item(dropdown_row)
 
-        # Buttons Action Row
+        # ── Action Buttons ──
         btn_row = discord.ui.ActionRow()
-        btn_cancel_sel = discord.ui.Button(label="🛑 Cancel Selected Creator", style=discord.ButtonStyle.danger, custom_id="cmp_cancel_sel")
-        btn_cancel_all = discord.ui.Button(label="🛑 Cancel ALL Campaigns", style=discord.ButtonStyle.secondary, custom_id="cmp_cancel_all")
-        btn_refresh = discord.ui.Button(label="🔄 Refresh Dashboard", style=discord.ButtonStyle.secondary, custom_id="cmp_refresh")
+        btn_cancel_sel = discord.ui.Button(label="⏹️ Stop Selected", style=discord.ButtonStyle.danger, custom_id="cmp_cancel_sel")
+        btn_cancel_all = discord.ui.Button(label="⏹️ Stop All", style=discord.ButtonStyle.secondary, custom_id="cmp_cancel_all")
+        btn_refresh = discord.ui.Button(label="🔄 Refresh", style=discord.ButtonStyle.primary, custom_id="cmp_refresh")
 
         btn_cancel_sel.callback = self.cancel_selected_callback
         btn_cancel_all.callback = self.cancel_all_callback
@@ -340,6 +494,12 @@ class F2FCampaignsDashboardView(discord.ui.LayoutView):
         btn_row.add_item(btn_refresh)
 
         container.add_item(btn_row)
+
+        # ── Footer ──
+        container.add_item(discord.ui.TextDisplay(
+            content="-# 🗄️ Persistent storage via MongoDB Atlas  •  Survives restarts"
+        ))
+
         return container
 
     async def initialize(self):
@@ -398,23 +558,38 @@ class F2FForwardViewV2(discord.ui.LayoutView):
         self.raw_message = raw_message
         self.author = author
 
-        self.container = discord.ui.Container(accent_color=discord.Color.blue())
-        prompt_text = (
-            f"## ⚡ F2F Outreach Campaign Prompt (@{self.creator_name})\n"
-            f"Creator **@{self.creator_name}** verified on F2F ✅\n\n"
-            f"**Raw Template Message:**\n> {self.raw_message}\n\n"
-            f"*Select an outreach action below to dispatch message.*"
-        )
-        self.container.add_item(discord.ui.TextDisplay(content=prompt_text))
+        self.container = discord.ui.Container(accent_color=discord.Color.from_str("#EB459E"))
+
+        self.container.add_item(discord.ui.TextDisplay(
+            content=f"# ⚡ Outreach Prompt"
+        ))
+        self.container.add_item(discord.ui.TextDisplay(
+            content=f"-# Target Model: **@{creator_name}**  •  Verified on F2F ✅"
+        ))
+
+        self.container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+        self.container.add_item(discord.ui.TextDisplay(
+            content=(
+                "### 💬 Raw Template Message\n"
+                f"> *\"{raw_message}\"*"
+            )
+        ))
+
+        self.container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+        self.container.add_item(discord.ui.TextDisplay(
+            content="-# Select an action below to test or launch the continuous outreach campaign:"
+        ))
 
         row1 = discord.ui.ActionRow()
         row2 = discord.ui.ActionRow()
 
-        btn_prod = discord.ui.Button(label="🚀 Start Continuous Outreach Loop", style=discord.ButtonStyle.success, custom_id="f2f_forward_prod")
-        btn_test_init = discord.ui.Button(label="🧪 Test Initial Message", style=discord.ButtonStyle.primary, custom_id="f2f_test_init")
-        btn_test_cooldown = discord.ui.Button(label="🛡️ Test 4h Cooldown Guard", style=discord.ButtonStyle.secondary, custom_id="f2f_test_cooldown")
-        btn_test_follow = discord.ui.Button(label="🔁 Test Follow-Up Message", style=discord.ButtonStyle.secondary, custom_id="f2f_test_follow")
-        btn_cancel = discord.ui.Button(label="❌ Cancel Prompt", style=discord.ButtonStyle.danger, custom_id="f2f_cancel_prompt")
+        btn_prod = discord.ui.Button(label="🚀 Start Continuous Loop", style=discord.ButtonStyle.success, custom_id="f2f_forward_prod")
+        btn_test_init = discord.ui.Button(label="🧪 Test Initial", style=discord.ButtonStyle.primary, custom_id="f2f_test_init")
+        btn_test_cooldown = discord.ui.Button(label="🛡️ Test Cooldown", style=discord.ButtonStyle.secondary, custom_id="f2f_test_cooldown")
+        btn_test_follow = discord.ui.Button(label="🔁 Test Follow-Up", style=discord.ButtonStyle.secondary, custom_id="f2f_test_follow")
+        btn_cancel = discord.ui.Button(label="❌ Cancel", style=discord.ButtonStyle.danger, custom_id="f2f_cancel_prompt")
 
         btn_prod.callback = self.forward_prod_callback
         btn_test_init.callback = self.test_init_callback
@@ -451,11 +626,12 @@ class F2FForwardViewV2(discord.ui.LayoutView):
             raw_message=self.raw_message
         )
 
+        cooldown_h = await self.campaign_service.get_cooldown_hours()
         await interaction.followup.send(
             f"🚀 **Continuous Outreach Loop Active for @{self.creator_name}**!\n"
             f"- 🆔 Campaign ID: `{cmp_id}`\n"
             f"- 🔄 Rescanning for newly online fans every **15 seconds**.\n"
-            f"- 🛡️ Enforcing **4-Hour Cooldown Guard** (No fan receives duplicate initial messages).\n"
+            f"- 🛡️ Enforcing **{cooldown_h}-Hour Cooldown Guard** (No fan receives duplicate initial messages).\n"
             f"- 👁️ Follow-ups dispatched ONLY to fans who **have opened & seen (`read: true`)** the initial message!",
             ephemeral=True
         )
