@@ -169,6 +169,48 @@ class CampaignService:
             return True
         return True
 
+    async def get_max_run_hours(self) -> int:
+        """Retrieves configured auto-stop run duration in hours from MongoDB (default 0 = unlimited)."""
+        if hasattr(self.db, "db") and self.db.db is not None:
+            doc = await self.db.db.settings.find_one({"_id": "max_run_hours"})
+            if doc and doc.get("hours") is not None:
+                return int(doc.get("hours"))
+        return 0
+
+    async def set_max_run_hours(self, hours: int) -> bool:
+        """
+        Owner-only: Updates configured auto-stop run duration in hours in MongoDB.
+        Recalculates auto_stop_at for all currently active campaigns in real-time!
+        """
+        new_hours = max(0, hours)
+        if hasattr(self.db, "db") and self.db.db is not None:
+            await self.db.db.settings.update_one(
+                {"_id": "max_run_hours"},
+                {"$set": {"_id": "max_run_hours", "hours": new_hours}},
+                upsert=True
+            )
+
+            # Recalculate auto_stop_at for active campaigns mid-campaign!
+            cursor = self.db.db.campaign_runs.find({"status": "active"})
+            active_cmps = await cursor.to_list(length=None)
+            for cmp in active_cmps:
+                created_at = cmp.get("created_at") or datetime.utcnow()
+                if new_hours > 0:
+                    auto_stop_at = created_at + timedelta(hours=new_hours)
+                    await self.db.db.campaign_runs.update_one(
+                        {"_id": cmp["_id"]},
+                        {"$set": {"max_run_hours": new_hours, "auto_stop_at": auto_stop_at}}
+                    )
+                else:
+                    await self.db.db.campaign_runs.update_one(
+                        {"_id": cmp["_id"]},
+                        {"$set": {"max_run_hours": 0}, "$unset": {"auto_stop_at": ""}}
+                    )
+
+            logger.info(f"Updated max run duration to {new_hours} hour(s) in MongoDB Atlas across active campaigns.")
+            return True
+        return True
+
     async def get_active_campaigns(self) -> list[dict]:
         """Retrieves active creator outreach campaigns from MongoDB."""
         if hasattr(self.db, "db") and self.db.db is not None:
@@ -314,6 +356,10 @@ class CampaignService:
                 return cmp_id
             else:
                 cmp_id = f"cmp_{int(datetime.utcnow().timestamp())}_{target_creator}"
+                now_created = datetime.utcnow()
+                max_run_h = await self.get_max_run_hours()
+                auto_stop_at = now_created + timedelta(hours=max_run_h) if max_run_h > 0 else None
+
                 doc = {
                     "_id": cmp_id,
                     "creator": target_creator,
@@ -321,14 +367,19 @@ class CampaignService:
                     "followup_text": configured_followup,
                     "status": "active",
                     "followup_gap_minutes": gap_min,
-                    "created_at": datetime.utcnow()
+                    "max_run_hours": max_run_h,
+                    "created_at": now_created
                 }
+                if auto_stop_at:
+                    doc["auto_stop_at"] = auto_stop_at
+
                 await self.db.db.campaign_runs.insert_one(doc)
                 cooldown_h = await self.get_cooldown_hours()
-                logger.info(f"🚀 Started continuous auto-rescanning campaign {cmp_id} for creator @{target_creator}.")
+                duration_str = f"{max_run_h}h auto-stop" if max_run_h > 0 else "Continuous (Unlimited)"
+                logger.info(f"🚀 Started outreach campaign {cmp_id} for creator @{target_creator} (Duration: {duration_str}).")
                 await self._notify_event(
                     "Continuous Outreach Loop Started",
-                    f"• Creator: **@{target_creator}**\n• Campaign ID: `{cmp_id}`\n• Initial Template:\n> *\"{raw_message[:150]}\"*\n• Polling: **Every 15s** with {cooldown_h}h cooldown.",
+                    f"• Creator: **@{target_creator}**\n• Campaign ID: `{cmp_id}`\n• Duration: **{duration_str}**\n• Initial Template:\n> *\"{raw_message[:150]}\"*\n• Polling: **Every 15s** with {cooldown_h}h cooldown.",
                     level="success"
                 )
                 return cmp_id
@@ -691,6 +742,23 @@ class CampaignService:
         raw_message = cmp.get("raw_message", "")
         if not raw_message:
             return
+
+        # Auto-Stop Duration Limit Check
+        auto_stop_at = cmp.get("auto_stop_at")
+        if auto_stop_at and isinstance(auto_stop_at, datetime):
+            if datetime.utcnow() >= auto_stop_at:
+                logger.info(f"⏰ Auto-stopping campaign {cmp_id} for @{creator}: Run duration limit reached ({cmp.get('max_run_hours')}h).")
+                if hasattr(self.db, "db") and self.db.db is not None:
+                    await self.db.db.campaign_runs.update_one(
+                        {"_id": cmp_id},
+                        {"$set": {"status": "completed", "completed_reason": "run_duration_exceeded", "completed_at": datetime.utcnow()}}
+                    )
+                await self._notify_event(
+                    "Outreach Loop Auto-Stopped",
+                    f"• Creator: **@{creator}**\n• Campaign ID: `{cmp_id}`\n• Status: Reached maximum run duration limit of `{cmp.get('max_run_hours')}` hour(s).",
+                    level="warning"
+                )
+                return
 
         online_chats = await self.f2f_client.get_online_chats(creator)
         if not online_chats:

@@ -182,6 +182,34 @@ class CooldownHoursModal(discord.ui.Modal, title="Edit Active Cooldown Window"):
         await self.refresh_callback(interaction)
 
 
+class MaxRunHoursModal(discord.ui.Modal, title="Edit Auto-Stop Run Duration"):
+    hours_input = discord.ui.TextInput(
+        label="Run Duration Limit in Hours (0 = Unlimited)",
+        placeholder="e.g. 2 (or 0 for unlimited)",
+        default="0",
+        min_length=1,
+        max_length=4,
+        required=True
+    )
+
+    def __init__(self, campaign_service: CampaignService, refresh_callback):
+        super().__init__()
+        self.campaign_service = campaign_service
+        self.refresh_callback = refresh_callback
+
+    async def on_submit(self, interaction: discord.Interaction):
+        val = self.hours_input.value.strip()
+        if not val.isdigit():
+            await interaction.response.send_message("❌ Duration must be a non-negative integer (e.g. 2 or 0).", ephemeral=True)
+            return
+
+        h_val = int(val)
+        await self.campaign_service.set_max_run_hours(h_val)
+        msg = f"✅ **Auto-Stop Run Duration updated to {h_val} hour(s)!** (Active campaigns updated in real-time)" if h_val > 0 else "✅ **Auto-Stop Run Duration set to Unlimited (0h)!**"
+        await interaction.response.send_message(msg, ephemeral=True)
+        await self.refresh_callback(interaction)
+
+
 class F2FConfigDashboardView(discord.ui.LayoutView):
     def __init__(self, campaign_service: CampaignService, author: discord.User | discord.Member):
         super().__init__(timeout=86400)
@@ -191,6 +219,7 @@ class F2FConfigDashboardView(discord.ui.LayoutView):
     async def build_dashboard_container(self) -> discord.ui.Container:
         gap = await self.campaign_service.get_followup_gap()
         cooldown = await self.campaign_service.get_cooldown_hours()
+        max_run_h = await self.campaign_service.get_max_run_hours()
         followup_txt = await self.campaign_service.get_followup_text()
         test_ids = await self.campaign_service.get_test_chat_ids()
         has_session = bool(self.campaign_service.f2f_client.session_id)
@@ -198,6 +227,7 @@ class F2FConfigDashboardView(discord.ui.LayoutView):
 
         session_str = f"🟢 Active (`{self.campaign_service.f2f_client.session_id[:10]}...`)" if has_session else "🔴 Disconnected"
         totp_str = "🟢 Configured" if has_totp else "🔴 Missing"
+        run_h_str = f"`{max_run_h}` hr" if max_run_h > 0 else "`∞` Unlimited"
 
         test_ids_formatted = "\n".join([f"╰ `{tid}`" for tid in test_ids]) if test_ids else "╰ *None configured*"
 
@@ -229,7 +259,8 @@ class F2FConfigDashboardView(discord.ui.LayoutView):
             content=(
                 "### 🎛️ Campaign Parameters\n"
                 f"╭ ⏱️ **Follow-Up Gap**  ›  `{gap}` min\n"
-                f"╰ 🛡️ **Cooldown Window**  ›  `{cooldown}` hr"
+                f"├ 🛡️ **Cooldown Window**  ›  `{cooldown}` hr\n"
+                f"╰ ⌛ **Auto-Stop Duration**  ›  {run_h_str}"
             )
         ))
 
@@ -258,25 +289,33 @@ class F2FConfigDashboardView(discord.ui.LayoutView):
 
         # ── Action Buttons ──
         row1 = discord.ui.ActionRow()
-        btn_gap = discord.ui.Button(label="⏱️ Follow-Up Gap", style=discord.ButtonStyle.primary, custom_id="cfg_gap")
+        row2 = discord.ui.ActionRow()
+
+        btn_gap = discord.ui.Button(label="⏱️ Gap", style=discord.ButtonStyle.primary, custom_id="cfg_gap")
         btn_cooldown = discord.ui.Button(label="🛡️ Cooldown", style=discord.ButtonStyle.primary, custom_id="cfg_cooldown")
+        btn_run_hours = discord.ui.Button(label="⌛ Duration", style=discord.ButtonStyle.primary, custom_id="cfg_run_hours")
         btn_text = discord.ui.Button(label="💬 Template", style=discord.ButtonStyle.primary, custom_id="cfg_text")
+
         btn_test_ids = discord.ui.Button(label="🎯 Test IDs", style=discord.ButtonStyle.secondary, custom_id="cfg_test_ids")
-        btn_refresh = discord.ui.Button(label="🔄", style=discord.ButtonStyle.secondary, custom_id="cfg_refresh")
+        btn_refresh = discord.ui.Button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, custom_id="cfg_refresh")
 
         btn_gap.callback = self.edit_gap_callback
         btn_cooldown.callback = self.edit_cooldown_callback
+        btn_run_hours.callback = self.edit_run_hours_callback
         btn_text.callback = self.edit_text_callback
         btn_test_ids.callback = self.edit_test_ids_callback
         btn_refresh.callback = self.refresh_callback
 
         row1.add_item(btn_gap)
         row1.add_item(btn_cooldown)
+        row1.add_item(btn_run_hours)
         row1.add_item(btn_text)
-        row1.add_item(btn_test_ids)
-        row1.add_item(btn_refresh)
+
+        row2.add_item(btn_test_ids)
+        row2.add_item(btn_refresh)
 
         container.add_item(row1)
+        container.add_item(row2)
         return container
 
     async def initialize(self):
@@ -310,6 +349,12 @@ class F2FConfigDashboardView(discord.ui.LayoutView):
         cooldown = await self.campaign_service.get_cooldown_hours()
         modal = CooldownHoursModal(self.campaign_service, self.refresh_dashboard)
         modal.hours_input.default = str(cooldown)
+        await interaction.response.send_modal(modal)
+
+    async def edit_run_hours_callback(self, interaction: discord.Interaction):
+        max_run = await self.campaign_service.get_max_run_hours()
+        modal = MaxRunHoursModal(self.campaign_service, self.refresh_dashboard)
+        modal.hours_input.default = str(max_run)
         await interaction.response.send_modal(modal)
 
     async def edit_text_callback(self, interaction: discord.Interaction):
@@ -416,7 +461,12 @@ class F2FCampaignsDashboardView(discord.ui.LayoutView):
             creator = cmp.get("creator", "unknown")
             pending = cmp.get("pending_users_count", 0)
             if creator not in creator_summary:
-                creator_summary[creator] = {"loops": 0, "pending_fans": 0, "latest_template": cmp.get("raw_message", "")}
+                creator_summary[creator] = {
+                    "loops": 0,
+                    "pending_fans": 0,
+                    "latest_template": cmp.get("raw_message", ""),
+                    "auto_stop_at": cmp.get("auto_stop_at")
+                }
             creator_summary[creator]["loops"] += 1
             creator_summary[creator]["pending_fans"] += pending
 
@@ -462,11 +512,18 @@ class F2FCampaignsDashboardView(discord.ui.LayoutView):
             snippet = f"{tpl[:60]}..." if len(tpl) > 60 else tpl
             loops = info["loops"]
             pending = info["pending_fans"]
+            auto_stop_at = info.get("auto_stop_at")
 
             status_dot = "🟢" if pending > 0 else "🟡"
+
+            time_limit_str = ""
+            if auto_stop_at and isinstance(auto_stop_at, datetime):
+                ts = int(auto_stop_at.timestamp())
+                time_limit_str = f"  ·  ⌛ **Stops**: <t:{ts}:R>"
+
             creator_card = (
                 f"{status_dot} **@{creator}**\n"
-                f"╭ 🔄 **Loops**: `{loops}`  ·  📬 **Queue**: `{pending:,}` fans\n"
+                f"╭ 🔄 **Loops**: `{loops}`  ·  📬 **Queue**: `{pending:,}` fans{time_limit_str}\n"
                 f"╰ 💬 *\"{snippet}\"*"
             )
             container.add_item(discord.ui.TextDisplay(content=creator_card))
@@ -627,9 +684,13 @@ class F2FForwardViewV2(discord.ui.LayoutView):
         )
 
         cooldown_h = await self.campaign_service.get_cooldown_hours()
+        max_run_h = await self.campaign_service.get_max_run_hours()
+        duration_str = f"**{max_run_h}-Hour Auto-Stop Limit** (Stops automatically after {max_run_h}h)" if max_run_h > 0 else "**Continuous (Unlimited)**"
+
         await interaction.followup.send(
-            f"🚀 **Continuous Outreach Loop Active for @{self.creator_name}**!\n"
+            f"🚀 **Outreach Campaign Active for @{self.creator_name}**!\n"
             f"- 🆔 Campaign ID: `{cmp_id}`\n"
+            f"- ⌛ Duration Mode: {duration_str}\n"
             f"- 🔄 Rescanning for newly online fans every **15 seconds**.\n"
             f"- 🛡️ Enforcing **{cooldown_h}-Hour Cooldown Guard** (No fan receives duplicate initial messages).\n"
             f"- 👁️ Follow-ups dispatched ONLY to fans who **have opened & seen (`read: true`)** the initial message!",
