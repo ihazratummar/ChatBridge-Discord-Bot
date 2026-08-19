@@ -385,74 +385,83 @@ class CampaignService:
                 return cmp_id
         return ""
 
-    async def has_user_replied(self, chat_id: str, creator: str, initial_sent_at: datetime | None = None) -> bool:
+    async def has_user_replied(self, chat_id: str, creator: str, initial_sent_at: datetime | None = None, chat_obj: dict | None = None) -> bool:
         """
-        Checks message history to see if target fan has replied.
-        Uses F2F 'received' boolean field (received=True means sent by fan).
-        Converts all timestamps to UTC to accurately compare against initial_sent_at!
+        Checks if target fan has replied without calling get_chat_messages (which marks unread messages as read on F2F).
+        Inspects chat_obj / chat_details summary payload (chat_obj['message'] and chat_obj['unread']) to preserve unread red dot badges!
         """
-        messages = await self.f2f_client.get_chat_messages(chat_id, creator)
-        if not messages or not isinstance(messages, list):
-            return False
+        target_chat = chat_obj
+        if not target_chat:
+            target_chat = await self.f2f_client.get_chat_summary(chat_id, creator)
 
-        for m in messages:
-            if not isinstance(m, dict):
-                continue
-
-            # F2F API: 'received': True indicates an incoming message from the fan
-            is_fan_msg = (
-                m.get("received") is True or
-                m.get("is_from_user") is True or
-                m.get("sender_type") == "user"
+        if target_chat and isinstance(target_chat, dict):
+            # 1. Comprehensive unread flag & count detection from all possible F2F schema keys
+            is_unread = (
+                bool(target_chat.get("unread")) or
+                bool(target_chat.get("is_unread")) or
+                bool(target_chat.get("has_unread")) or
+                (target_chat.get("unread_count", 0) > 0) or
+                (target_chat.get("unread_messages_count", 0) > 0)
             )
 
-            if is_fan_msg:
-                msg_date_str = m.get("datetime") or m.get("created_at") or m.get("created")
-                if initial_sent_at and msg_date_str:
-                    msg_dt = parse_f2f_datetime(msg_date_str)
-                    if msg_dt and msg_dt >= initial_sent_at:
-                        logger.info(f"🛑 Fan replied at {msg_dt} UTC (after initial sent at {initial_sent_at} UTC)!")
+            # 2. Inspect latest message in chat payload
+            last_msg = target_chat.get("message") or target_chat.get("last_message")
+            if last_msg and isinstance(last_msg, dict):
+                is_fan_msg = (
+                    last_msg.get("received") is True or
+                    last_msg.get("is_from_user") is True or
+                    last_msg.get("sender_type") == "user" or
+                    (last_msg.get("read") is False and last_msg.get("received") is not False)
+                )
+
+                if is_fan_msg or is_unread:
+                    msg_date_str = last_msg.get("datetime") or last_msg.get("created_at") or last_msg.get("created")
+                    if initial_sent_at and msg_date_str:
+                        msg_dt = parse_f2f_datetime(msg_date_str)
+                        if msg_dt and msg_dt >= initial_sent_at:
+                            logger.info(f"🛑 Fan replied at {msg_dt} UTC (after initial sent at {initial_sent_at} UTC)!")
+                            return True
+                    elif not initial_sent_at:
+                        logger.info(f"🛑 Detected fan reply message in chat {chat_id} (content: '{last_msg.get('content')}')!")
                         return True
-                elif not initial_sent_at:
-                    logger.info(f"🛑 Detected fan reply message in chat {chat_id} (content: '{m.get('content')}')!")
-                    return True
+
+            # If unread count > 0 and no initial_sent_at restriction, treat as replied
+            if is_unread and not initial_sent_at:
+                logger.info(f"🛑 Chat {chat_id} has unread incoming message from fan!")
+                return True
 
         return False
 
-    async def has_user_seen_message(self, chat_id: str, creator: str, initial_sent_at: datetime | None = None) -> bool:
+    async def has_user_seen_message(self, chat_id: str, creator: str, initial_sent_at: datetime | None = None, chat_obj: dict | None = None) -> bool:
         """
-        Checks F2F message history to see if the target fan has SEEN/READ the initial message.
-        Returns True if ANY outgoing initial message sent at/after initial_sent_at has read: true on F2F.
-        Includes a 5-second clock skew leeway for server clock differences.
+        Checks if the target fan has SEEN/READ the initial message without calling get_chat_messages.
+        Inspects chat_obj['message'] summary payload to preserve unread notification badges!
         """
-        messages = await self.f2f_client.get_chat_messages(chat_id, creator)
-        if not messages or not isinstance(messages, list):
-            return False
+        target_chat = chat_obj
+        if not target_chat:
+            target_chat = await self.f2f_client.get_chat_summary(chat_id, creator)
 
-        # Allow 5 second clock skew leeway between F2F API server and local/VPS clock
-        leeway_sent_at = (initial_sent_at - timedelta(seconds=5)) if initial_sent_at else None
+        if target_chat and isinstance(target_chat, dict):
+            last_msg = target_chat.get("message") or target_chat.get("last_message")
+            if last_msg and isinstance(last_msg, dict):
+                is_outgoing = (
+                    last_msg.get("received") is False or
+                    last_msg.get("is_from_user") is False or
+                    bool(last_msg.get("sent_by_agent")) or
+                    last_msg.get("sender_type") in ("agent", "creator", "system")
+                )
+                if is_outgoing:
+                    msg_date_str = last_msg.get("datetime") or last_msg.get("created_at") or last_msg.get("created")
+                    msg_dt = parse_f2f_datetime(msg_date_str) if msg_date_str else None
 
-        for m in messages:
-            if not isinstance(m, dict):
-                continue
-
-            is_outgoing = (
-                m.get("received") is False or
-                m.get("is_from_user") is False or
-                bool(m.get("sent_by_agent")) or
-                m.get("sender_type") in ("agent", "creator", "system")
-            )
-            if is_outgoing:
-                msg_date_str = m.get("datetime") or m.get("created_at") or m.get("created")
-                msg_dt = parse_f2f_datetime(msg_date_str) if msg_date_str else None
-
-                if leeway_sent_at and msg_dt and msg_dt >= leeway_sent_at:
-                    is_read = m.get("read") is True or m.get("is_read") is True or m.get("seen") is True
-                    if is_read:
-                        logger.info(f"👁️ Fan '{chat_id}' has SEEN initial message (sent at {msg_dt} UTC).")
+                    leeway_sent_at = (initial_sent_at - timedelta(seconds=5)) if initial_sent_at else None
+                    if leeway_sent_at and msg_dt and msg_dt >= leeway_sent_at:
+                        is_read = last_msg.get("read") is True or last_msg.get("is_read") is True or last_msg.get("seen") is True
+                        if is_read:
+                            logger.info(f"👁️ Fan '{chat_id}' has SEEN initial message (sent at {msg_dt} UTC).")
+                            return True
+                    elif not leeway_sent_at and (last_msg.get("read") is True or last_msg.get("is_read") is True or last_msg.get("seen") is True):
                         return True
-                elif not leeway_sent_at and (m.get("read") is True or m.get("is_read") is True or m.get("seen") is True):
-                    return True
 
         return False
 
@@ -478,7 +487,7 @@ class CampaignService:
         # 2. Check Live F2F Chat's Last Outgoing Message Timestamp (Supports human chatter sends)
         target_chat = chat_obj
         if not target_chat:
-            target_chat = await self.f2f_client.get_chat_details(chat_id, creator)
+            target_chat = await self.f2f_client.get_chat_summary(chat_id, creator)
 
         if target_chat and isinstance(target_chat, dict):
             last_msg = target_chat.get("message")
@@ -532,7 +541,7 @@ class CampaignService:
 
         if test_chat_id:
             # Strictly use target_creator for the active Discord channel
-            details = await self.f2f_client.get_chat_details(test_chat_id, target_creator)
+            details = await self.f2f_client.get_chat_summary(test_chat_id, target_creator)
             fan_name = "Fan"
             if details and isinstance(details, dict):
                 fan_name = details.get("title") or details.get("other_user", {}).get("username") or "Fan"
@@ -701,7 +710,7 @@ class CampaignService:
         """Instantly tests sending a follow-up message strictly on behalf of the active channel creator."""
         target_creator = re.sub(r'[^\x00-\x7F]+', '', creator).lower().replace("#", "").strip()
 
-        details = await self.f2f_client.get_chat_details(test_chat_id, target_creator)
+        details = await self.f2f_client.get_chat_summary(test_chat_id, target_creator)
         fan_name = "Fan"
         if details and isinstance(details, dict):
             fan_name = details.get("title") or details.get("other_user", {}).get("username") or "Fan"
@@ -802,7 +811,7 @@ class CampaignService:
                     continue
 
                 # 2. Live Reply Safety Check
-                if await self.has_user_replied(chat_id, creator):
+                if await self.has_user_replied(chat_id, creator, chat_obj=chat):
                     continue
 
                 # 3. Personalize and Send Initial Message
@@ -886,8 +895,10 @@ class CampaignService:
                         )
                         continue
 
+                    target_chat = await self.f2f_client.get_chat_summary(chat_id, creator)
+
                     # 2. Live Reply Safety Check (Stop User)
-                    if await self.has_user_replied(chat_id, creator, initial_sent_at=initial_sent):
+                    if await self.has_user_replied(chat_id, creator, initial_sent_at=initial_sent, chat_obj=target_chat):
                         logger.info(f"🛑 Follow-up SKIPPED for fan '{fan_name}' ({chat_id}): Fan has replied!")
                         await self.db.db.campaign_user_states.update_one(
                             {"_id": user_state["_id"]},
@@ -896,7 +907,7 @@ class CampaignService:
                         continue
 
                     # 3. Live Seen/Read Safety Check (Only send follow-up if fan HAS SEEN the initial message!)
-                    if not await self.has_user_seen_message(chat_id, creator, initial_sent_at=initial_sent):
+                    if not await self.has_user_seen_message(chat_id, creator, initial_sent_at=initial_sent, chat_obj=target_chat):
                         logger.info(f"⏳ Follow-up SKIPPED for fan '{fan_name}' ({chat_id}): Fan has NOT seen/read the message yet.")
                         continue
 

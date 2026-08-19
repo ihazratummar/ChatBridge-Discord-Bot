@@ -346,6 +346,19 @@ class F2FClient:
             logger.error(f"HTTP Error fetching recent chats for creator @{creator}: {e}", exc_info=True)
             return []
 
+    async def get_chat_summary(self, chat_id: str, creator: str) -> dict | None:
+        """
+        Fetches the chat summary dictionary from the general chats list (GET /chats/) WITHOUT calling GET /chats/{chat_id}/.
+        This GUARANTEES that unread status and red notification badges on F2F remain 100% untouched!
+        """
+        recent_chats = await self.get_recent_chats(creator)
+        for chat in recent_chats:
+            if isinstance(chat, dict):
+                c_uuid = str(chat.get("uuid") or chat.get("id") or "")
+                if c_uuid == str(chat_id):
+                    return chat
+        return None
+
     async def get_chat_details(self, chat_id: str, creator: str, auto_retry: bool = True) -> dict | None:
         """Fetches chat metadata details (title, user info) for a specific chat ID."""
         await self._ensure_session()
