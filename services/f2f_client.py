@@ -257,6 +257,36 @@ class F2FClient:
         else:
             logger.warning("⚠️ No sessionid or csrftoken found in response cookies.")
 
+    @staticmethod
+    def is_chat_online(chat: dict) -> bool:
+        """Strictly checks whether a chat dictionary represents an ONLINE fan."""
+        if not isinstance(chat, dict):
+            return False
+        user_obj = chat.get("user") if isinstance(chat.get("user"), dict) else {}
+        other_obj = chat.get("other_user") if isinstance(chat.get("other_user"), dict) else {}
+
+        if (
+            chat.get("is_online") is True or
+            other_obj.get("is_online") is True or
+            user_obj.get("is_online") is True or
+            chat.get("status") == "online" or
+            other_obj.get("status") == "online" or
+            user_obj.get("status") == "online"
+        ):
+            return True
+
+        if (
+            chat.get("is_online") is False or
+            other_obj.get("is_online") is False or
+            user_obj.get("is_online") is False or
+            chat.get("status") == "offline" or
+            other_obj.get("status") == "offline" or
+            user_obj.get("status") == "offline"
+        ):
+            return False
+
+        return False
+
     async def get_online_chats(self, creator: str, max_pages: int = 10, auto_retry: bool = True) -> list[dict]:
         """Fetches all online chats for creator by traversing F2F API pagination cursor ('next')."""
         await self._ensure_session()
@@ -298,8 +328,10 @@ class F2FClient:
                 logger.error(f"HTTP Error fetching online chats page {page_count} for @{creator}: {e}", exc_info=True)
                 break
 
-        logger.info(f"Total online chats fetched for creator @{creator}: {len(all_chats)} across {page_count} page(s).")
-        return all_chats
+        # Filter strictly for online chats
+        verified_online = [c for c in all_chats if self.is_chat_online(c)]
+        logger.info(f"Total online chats fetched for creator @{creator}: {len(verified_online)} (filtered from {len(all_chats)}) across {page_count} page(s).")
+        return verified_online
 
     async def validate_creator_exists(self, creator: str, auto_retry: bool = True) -> bool:
         """Verifies whether the given creator handle exists and is authorized on F2F."""

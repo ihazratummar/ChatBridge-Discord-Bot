@@ -404,6 +404,12 @@ class CampaignService:
                 (target_chat.get("unread_messages_count", 0) > 0)
             )
 
+            # CRITICAL RULE: If the chat currently has an active unread badge on F2F, ALWAYS treat as replied/stop!
+            # Never send a follow-up message to a chat that has an active unread badge!
+            if is_unread:
+                logger.info(f"🛑 Chat {chat_id} currently has an unread badge/message on F2F! Treating as replied/stop.")
+                return True
+
             # 2. Inspect latest message in chat payload
             last_msg = target_chat.get("message") or target_chat.get("last_message")
             if last_msg and isinstance(last_msg, dict):
@@ -414,21 +420,16 @@ class CampaignService:
                     (last_msg.get("read") is False and last_msg.get("received") is not False)
                 )
 
-                if is_fan_msg or is_unread:
+                if is_fan_msg:
                     msg_date_str = last_msg.get("datetime") or last_msg.get("created_at") or last_msg.get("created")
                     if initial_sent_at and msg_date_str:
                         msg_dt = parse_f2f_datetime(msg_date_str)
-                        if msg_dt and msg_dt >= initial_sent_at:
+                        if msg_dt and msg_dt >= (initial_sent_at - timedelta(seconds=10)):
                             logger.info(f"🛑 Fan replied at {msg_dt} UTC (after initial sent at {initial_sent_at} UTC)!")
                             return True
-                    elif not initial_sent_at:
+                    else:
                         logger.info(f"🛑 Detected fan reply message in chat {chat_id} (content: '{last_msg.get('content')}')!")
                         return True
-
-            # If unread count > 0 and no initial_sent_at restriction, treat as replied
-            if is_unread and not initial_sent_at:
-                logger.info(f"🛑 Chat {chat_id} has unread incoming message from fan!")
-                return True
 
         return False
 
@@ -803,6 +804,11 @@ class CampaignService:
             )
             if is_creator_account:
                 logger.info(f"🛡️ Skipping chat '{chat_id}' ({fan_name}): Target is another creator account!")
+                continue
+
+            # 0. Strict Online Status Safety Check
+            if not self.f2f_client.is_chat_online(chat):
+                logger.info(f"🚫 Skipping chat '{chat_id}' ({fan_name}): Target fan is OFFLINE!")
                 continue
 
             try:
