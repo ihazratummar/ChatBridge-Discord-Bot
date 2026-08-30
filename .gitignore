@@ -7,12 +7,16 @@ __pycache__/
 .env
 .env.*
 *.env
+**/.env
+**/.env.*
 
 # Virtual Environments
 .venv/
 venv/
 env/
 ENV/
+**/.venv/
+**/venv/
 
 # Database files, dumps & reports
 *.db

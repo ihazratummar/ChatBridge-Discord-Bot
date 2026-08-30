@@ -1,83 +1,100 @@
-# MASTER PLAN: F2F Live Stream Automation & OBS Studio Integration
+# MASTER ARCHITECTURE & UPDATED PLAN: ChatBridge & F2F Live Automation
 
-Master architecture and 0-to-100% operational setup guide for automating F2F Live Stream Audience Switching (15s Global ↔ 5s Followers Only) and OBS Video End Auto-Pause synchronization across agency creator models.
+Comprehensive roadmap combining:
+1. **ChatBridge Bot Updates & Migration**: Unreplied Fans Scanner, Coworker Permission System, VPS Migration Guide, and SOP documentation.
+2. **F2F Live Stream & OBS Automation**: Updated multi-creator architecture reflecting Benjamin's latest confirmation (*Live streams & live chat are scoped to individual Creator Accounts*).
 
 ---
 
-## 📐 System Architecture
+## 🏗️ UPDATED SYSTEM ARCHITECTURE
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                                   CLIENT'S LOCAL PC                                     │
-│                                                                                         │
-│   ┌────────────────────────┐  OBS WS v5 (ws://127.0.0.1:4455)  ┌──────────────────────┐  │
-│   │    OBS Studio v28+     │ <──────────────────────────────> │    OBS Python Agent  │  │
-│   │  (Media Source Output) │                                  │   (`obs_agent/`)     │  │
-│   └───────────▲────────────┘                                  └──────────┬───────────┘  │
-│               │                                                          │              │
-│               │ Rendered inside OBS as Dock Panel                        │              │
-│   ┌───────────┴────────────┐  Local API Calls / WebSockets               │              │
-│   │  OBS Custom Browser    │ <───────────────────────────────────────────┘              │
-│   │  Dock UI (`dock.html`) │                                                            │
-│   └────────────────────────┘                                                            │
+│                                   CLIENT'S MOBILE PHONE                                 │
+│                   (Private Discord Server — Controls & Unreplied Scanner)                │
 └───────────────────────────────────────────┬─────────────────────────────────────────────┘
                                             │
-                                 Secure WSS / HTTP Webhook
-                              (https://vps-server-domain/api)
+                                  Discord Slash Commands & Webhooks
                                             │
                                             ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                                   VPS REMOTE SERVER                                     │
+│                           CENTRAL LINUX VPS (Ubuntu Server)                             │
 │                                                                                         │
-│   ┌─────────────────────────────────────────────────────────────────────────────────┐   │
-│   │                             FastAPI Application (`fastapi_server/`)             │   │
-│   │                                                                                 │   │
-│   │  ┌──────────────────────┐     ┌───────────────────────┐   ┌──────────────────┐  │   │
-│   │  │   FastAPI Web Engine │ ──> │ F2F Live Switcher     │ ─>│ F2F API Client   │  │   │
-│   │  │ (REST & WebSockets)  │     │ (15s/5s Loop & Verif) │   │ (`curl_cffi`)    │  │   │
-│   │  └──────────────────────┘     └───────────────────────┘   └────────┬─────────┘  │   │
-│   └────────────────────────────────────────────────────────────────────┼────────────┘   │
-│                                                                        │                │
-│                                           REST API (TLS Impersonation) │                │
-│                                           `POST /api/livestreams/{id}/audience/`        │
-│                                                                        ▼                │
-│                                                               ┌──────────────────┐      │
-│                                                               │  F2F Platform    │      │
-│                                                               │ (Live Broadcast) │      │
-│                                                               └──────────────────┘      │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
+│  ┌───────────────────────┐   ┌───────────────────────────┐   ┌───────────────────────┐  │
+│  │ FastAPI Central Hub   │   │ Unreplied Fans Scanner    │   │ Discord Control Bot   │  │
+│  │ (Multi-Creator Sync)  │   │ (Posts unreplied fans)    │   │ (Mobile Panel & SOP)  │  │
+│  └───────────────────────┘   └───────────────────────────┘   └───────────────────────┘  │
+└───────────────────────────────────────────┬─────────────────────────────────────────────┘
+                                            │
+                                  Secure HTTP / WebSockets
+                                            │
+         ┌──────────────────────────────────┼──────────────────────────────────┐
+         │                                  │                                  │
+         ▼                                  ▼                                  ▼
+┌──────────────────────────┐   ┌──────────────────────────┐   ┌──────────────────────────┐
+│ WINDOWS VPS NODE #1      │   │ WINDOWS VPS NODE #2      │   │ WINDOWS VPS NODE #5      │
+│ Model: @xsophiex         │   │ Model: @chantalkuyt      │   │ Model: @aylen            │
+│ ──────────────────────── │   │ ──────────────────────── │   │ ──────────────────────── │
+│ • Creator Account Auth   │   │ • Creator Account Auth   │   │ • Creator Account Auth   │
+│ • OBS Studio Video Loop  │   │ • OBS Studio Video Loop  │   │ • OBS Studio Video Loop  │
+│ • obs_agent.py (5s alert)│   │ • obs_agent.py (5s alert)│   │ • obs_agent.py (5s alert)│
+│ • 15s/5s FYP Loop Engine │   │ • 15s/5s FYP Loop Engine │   │ • 15s/5s FYP Loop Engine │
+│ • F2F Live Stream & Chat │   │ • F2F Live Stream & Chat │   │ • F2F Live Stream & Chat │
+│ • Discord Screenshare    │   │ • Discord Screenshare    │   │ • Discord Screenshare    │
+└──────────────────────────┘   └──────────────────────────┘   └──────────────────────────┘
 ```
 
 ---
 
-## 📁 Repository Structure
+## 🎯 PART A: ChatBridge Current Bot Enhancements & Migration
 
-```text
-ChatBridge/
-├── MASTER_PLAN.md                       # Master Architecture & Operational Guide
-├── obs_agent/                           # LOCAL CLIENT PC MODULE
-│   └── plan.md                          # Dedicated OBS Agent & Custom Dock Specification
-└── fastapi_server/                      # REMOTE VPS SERVER MODULE
-    └── plan.md                          # Dedicated FastAPI & F2F Live API Specification
-```
+### 1. Unreplied Fans Scanner (`services/unreplied_scanner_service.py`)
+- **Functionality**: Scans all active chats for each creator model.
+- **Detection Logic**: Identifies chats where the last message is an unreplied incoming fan message (`is_from_user: True` or `unread: True`).
+- **Discord Notification**: Dispatches rich embed cards to `#unreplied-fans` channel listing fan username, wait time, and direct chat link so human chatters can jump in immediately.
 
----
+### 2. Coworker Permission & Role Manager (`cogs/coworker_permissions.py`)
+- Creates granular Discord permission roles (`@Manager`, `@Chatter`, `@Viewer`).
+- Restricts bot settings and configuration commands to `@Manager`.
+- Allows `@Chatter` to view unreplied fan feeds and live stream status.
 
-## 🎯 Discovered Production Endpoints (F2F Platform)
-
-* **Audience Switcher Endpoint**:
-  `POST https://f2f.com/api/livestreams/{livestreamUuid}/audience/`
-* **Headers**: `Content-Type: application/json` + `impersonate-user: <creator_handle>`
-* **Payload Options**:
-  - `{"target": "public"}` $\rightarrow$ **Global FYP Preview (15s)**
-  - `{"target": "fans-and-followers"}` $\rightarrow$ **Followers & Fans Only (5s)**
-  - `{"target": "fans-only"}` $\rightarrow$ **Paid Subscribers Only**
-* **Live Session Metadata Lookup**:
-  `GET https://f2f.com/api/creators/{creator_handle}/`
+### 3. VPS Migration & SOP Documentation (`MIGRATION_SOP.md`)
+- Complete setup guide for Benjamin to deploy the bot on his own Ubuntu VPS before your trial VPS expires in 2–3 days.
+- Step-by-step Standard Operating Procedure (SOP) manual for agency chatters.
 
 ---
 
-## 📑 Module Overview
+## ⚡ PART B: F2F Live Stream & OBS Automation (Updated Architecture)
 
-1. **`obs_agent/plan.md`**: Outlines local OBS WebSocket connection (`127.0.0.1:4455`), real-time media source monitor (detects 5s remaining on active video), and OBS Custom Browser Dock UI.
-2. **`fastapi_server/plan.md`**: Outlines VPS FastAPI engine, `curl_cffi` 2FA TOTP authentication, 15s Global $\leftrightarrow$ 5s Followers audience loop switcher, and video end auto-pause handler.
+### Key Discovery from Client:
+> *"Agency account has access to all creator accounts, but NOT inside lives. Only creator account has access to live streams and live chat."*
+
+### Updated Technical Strategy:
+1. **Creator-Direct Authentication**:
+   - Each Windows VPS Node logs in directly as that Creator Model (`@xsophiex`, `@chantalkuyt`, etc.) using creator credentials + 2FA TOTP (`pyotp`).
+2. **OBS WebSocket 5-Second Video End Alert**:
+   - `obs_agent.py` monitors OBS Media Source position. When remaining duration $\le 5.0\text{s}$, alerts the engine to pause F2F stream output for $X$ seconds delay before resuming.
+3. **F2F FYP Audience Switcher**:
+   - Executes 50ms REST API calls (`POST /api/livestreams/{uuid}/audience/`) cycling **15s Global (`public`) $\leftrightarrow$ 5s Followers Only (`fans-and-followers`)**.
+4. **Live Stream Chat Dispatcher**:
+   - Allows sending live in-stream comments (in Dutch or English) directly from Benjamin's phone via Discord `/live-chat` slash command.
+
+---
+
+## 🗓️ IMPLEMENTATION PHASES
+
+### Phase 1: ChatBridge Migration & Unreplied Fans Scanner (Immediate: 1–2 Days)
+- Build `unreplied_scanner_service.py` & `#unreplied-fans` Discord feed.
+- Create `MIGRATION_SOP.md` & assist Benjamin with VPS transfer before current VPS expires in 2 days.
+
+### Phase 2: F2F Live Stream API Client & Creator Engine (Days 3–4)
+- Build Creator Account 2FA live client for F2F (`POST /api/livestreams/{uuid}/audience/`).
+- Build 15s/5s FYP audience loop switcher with response verification.
+
+### Phase 3: OBS Agent & Custom Browser Dock (Days 5–6)
+- Build `obs_agent.py` with OBS WebSocket v5 remaining time monitor.
+- Create `dock_panel.html` UI embedded natively in OBS Studio.
+
+### Phase 4: Discord Mobile Control Hub & 5-VPS Staging (Day 7)
+- Integrate Discord mobile panel (`/live-status`, `/live-toggle`, `/live-chat`).
+- Staging on Benjamin's 5 Windows VPS nodes + 1 Central Linux Controller VPS.

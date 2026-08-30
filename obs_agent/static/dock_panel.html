@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>F2F Live Manager - OBS Dock</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
+    body { background-color: #181825; color: #cdd6f4; padding: 12px; font-size: 13px; }
+    .card { background-color: #1e1e2e; border: 1px solid #313244; border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+    .header { font-size: 14px; font-weight: 700; color: #89b4fa; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between; }
+    label { display: block; font-size: 11px; text-transform: uppercase; color: #a6adc8; margin-bottom: 4px; font-weight: 600; }
+    select { width: 100%; padding: 8px 10px; background-color: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 6px; font-size: 13px; font-weight: 600; outline: none; margin-bottom: 8px; cursor: pointer; }
+    select:focus { border-color: #89b4fa; }
+    .badge { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+    .badge-success { background-color: rgba(166, 227, 161, 0.15); color: #a6e3a1; border: 1px solid #a6e3a1; }
+    .badge-danger { background-color: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid #f38ba8; }
+    .badge-warning { background-color: rgba(249, 226, 175, 0.15); color: #f9e2af; border: 1px solid #f9e2af; }
+    .telemetry { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
+    .metric { background-color: #313244; padding: 8px; border-radius: 6px; text-align: center; }
+    .metric-value { font-size: 16px; font-weight: 700; color: #f5e0dc; margin-top: 2px; }
+    .metric-label { font-size: 10px; color: #a6adc8; }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+    <div class="header">
+      <span>🎬 F2F Live Manager</span>
+      <span id="conn-status" class="badge badge-danger">Connecting</span>
+    </div>
+
+    <label for="creator-select">👤 Active Creator Model</label>
+    <select id="creator-select" onchange="changeCreator()">
+      <option value="xsophiex">@xsophiex</option>
+      <option value="chantalkuyt">@chantalkuyt</option>
+      <option value="aylen">@aylen</option>
+      <option value="sophie">@sophie</option>
+    </select>
+  </div>
+
+  <div class="card">
+    <div class="header">
+      <span>📊 Real-Time Video Status</span>
+      <span id="media-source" class="badge badge-warning">Media: Loading...</span>
+    </div>
+
+    <div class="telemetry">
+      <div class="metric">
+        <div class="metric-label">Time Remaining</div>
+        <div id="time-left" class="metric-value">--:--</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Playback State</div>
+        <div id="media-state" class="metric-value" style="font-size: 13px;">--</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function loadConfig() {
+      try {
+        const res = await fetch('/api/config');
+        const cfg = await res.json();
+        const select = document.getElementById('creator-select');
+        select.value = cfg.selected_creator || 'xsophiex';
+      } catch (e) {
+        console.error("Config fetch error:", e);
+      }
+    }
+
+    async function changeCreator() {
+      const select = document.getElementById('creator-select');
+      const creator = select.value;
+      try {
+        await fetch('/api/set-creator', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ creator: creator })
+        });
+      } catch (e) {
+        console.error("Set creator error:", e);
+      }
+    }
+
+    async function updateStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+
+        const conn = document.getElementById('conn-status');
+        const mediaSource = document.getElementById('media-source');
+        const timeLeft = document.getElementById('time-left');
+        const mediaState = document.getElementById('media-state');
+
+        if (data.is_connected) {
+          conn.className = 'badge badge-success';
+          conn.innerText = 'OBS Connected';
+        } else {
+          conn.className = 'badge badge-danger';
+          conn.innerText = 'OBS Offline';
+        }
+
+        if (data.input_name) {
+          mediaSource.innerText = data.input_name;
+          const remSec = Math.max(0, Math.floor(data.remaining_sec || 0));
+          const mins = Math.floor(remSec / 60).toString().padStart(2, '0');
+          const secs = (remSec % 60).toString().padStart(2, '0');
+          timeLeft.innerText = `${mins}:${secs}`;
+          mediaState.innerText = data.state || 'PLAYING';
+        } else {
+          mediaSource.innerText = 'No Media Source';
+          timeLeft.innerText = '--:--';
+          mediaState.innerText = 'STOPPED';
+        }
+      } catch (e) {
+        document.getElementById('conn-status').className = 'badge badge-danger';
+        document.getElementById('conn-status').innerText = 'Agent Offline';
+      }
+    }
+
+    loadConfig();
+    setInterval(updateStatus, 500);
+  </script>
+</body>
+</html>

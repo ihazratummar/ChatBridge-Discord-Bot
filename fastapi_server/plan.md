@@ -1,16 +1,23 @@
-# FASTAPI SERVER MODULE PLAN (`fastapi_server/`)
+# FASTAPI SERVER & SERVICES MODULE PLAN (`fastapi_server/`)
 
-Dedicated specification and architecture guide for the VPS-side FastAPI Backend and F2F Live Stream Automation Engine.
+Updated technical specification for the VPS Backend Services, Unreplied Fans Scanner, and F2F Live Stream Automation Engine.
 
 ---
 
-## 🎯 Purpose & Scope
+## 🎯 Purpose & Core Capabilities
 
-The `fastapi_server/` module runs on the remote VPS server. It handles:
-1. **F2F API Live Control Engine**: Executes 50ms HTTP REST API requests to F2F to toggle live stream audience settings (`POST /api/livestreams/{uuid}/audience/`) with full 2FA TOTP authentication (`pyotp`) and Chrome TLS impersonation (`curl_cffi`).
-2. **15s Global ↔ 5s Followers Audience Switcher**: Background async loop cycling audience modes (15s `"public"` $\rightarrow$ 5s `"fans-and-followers"` $\rightarrow$ repeat) with live response state verification.
-3. **5-Second Video End Auto-Pause Coordinator**: Receives `video_ending` webhooks from the local OBS Agent, pauses/mutes F2F stream output for a configurable $X$-second delay, then resumes playback.
-4. **REST & WebSocket Control Endpoints**: Provides web API routes for the OBS Custom Browser Dock and live status telemetry.
+1. **Unreplied Fans Scanner (`services/unreplied_scanner_service.py`)**:
+   - Traverses active chats for creator models.
+   - Identifies incoming messages that have NOT received a reply from human chatters or the bot.
+   - Dispatches real-time alerts to the dedicated `#unreplied-fans` Discord channel.
+2. **Creator-Scoped F2F Live API Engine (`services/f2f_live_client.py`)**:
+   - F2F Live Streams & Live Chat are scoped directly to individual Creator Accounts.
+   - Authenticates using creator credentials + 2FA TOTP (`pyotp`) with Chrome TLS impersonation (`curl_cffi`).
+   - Executes 50ms REST requests (`POST /api/livestreams/{uuid}/audience/`).
+3. **15s Global ↔ 5s Followers Audience Switcher (`services/audience_switcher.py`)**:
+   - Async background task running the FYP traffic loop (`public` $\leftrightarrow$ `fans-and-followers`) with response state verification.
+4. **5-Second Video End Stream Pauser (`services/stream_pauser.py`)**:
+   - Handles 5-second video end alerts from local OBS agents, pausing F2F stream output for $X$ seconds delay before resuming.
 
 ---
 
@@ -18,54 +25,28 @@ The `fastapi_server/` module runs on the remote VPS server. It handles:
 
 ```text
 fastapi_server/
-├── plan.md                       # This dedicated module plan
-├── .env                          # F2F credentials, 2FA secret, MongoDB Atlas URI
-├── main.py                       # FastAPI application entry point
-├── requirements.txt              # Dependencies (fastapi, uvicorn, curl_cffi, pyotp, motor)
+├── plan.md                             # This dedicated module plan
+├── .env                                # F2F credentials, 2FA secrets, MongoDB Atlas URI
+├── main.py                             # FastAPI entry point & WebSockets
+├── requirements.txt                    # Dependencies (fastapi, uvicorn, curl_cffi, pyotp, motor)
 ├── core/
-│   ├── config.py                 # Environment Pydantic schema
-│   └── database.py               # Cloud MongoDB Atlas connection manager
+│   ├── config.py                       # Environment configuration schema
+│   └── database.py                     # Cloud MongoDB Atlas connection manager
 ├── services/
-│   ├── f2f_live_client.py        # curl_cffi client (2FA TOTP login & F2F REST API)
-│   ├── audience_switcher.py      # 15s Global ↔ 5s Followers loop engine
-│   └── stream_pauser.py          # 5s Video End Auto-Pause & Resume coordinator
+│   ├── unreplied_scanner_service.py    # Unreplied fans scanner & Discord notification builder
+│   ├── f2f_live_client.py              # Creator 2FA auth & F2F Live REST API engine
+│   ├── audience_switcher.py            # 15s Global ↔ 5s Followers loop engine
+│   └── stream_pauser.py                # 5s Video End Auto-Pause & Resume coordinator
 └── routes/
-    ├── api_routes.py             # REST API endpoints (/api/active-creator, /api/obs-event, etc.)
-    └── websocket_routes.py       # Bi-directional WebSocket endpoint for OBS Dock UI
+    ├── api_routes.py                   # REST endpoints (/api/unreplied-fans, /api/obs-event)
+    └── websocket_routes.py             # WebSockets for OBS Dock & Discord Mobile Hub
 ```
 
 ---
 
-## ⚙️ Key Technical Features
+## ⚙️ REST & Discord Integration Points
 
-### 1. F2F Live Client (`services/f2f_live_client.py`)
-- Reuses `curl_cffi` AsyncSession with Chrome TLS fingerprinting.
-- Autonomous 2FA TOTP login via `pyotp`.
-- Methods:
-  - `get_active_livestream_uuid(creator_handle: str) -> str`
-  - `set_audience_mode(creator_handle: str, livestream_uuid: str, mode: str) -> bool`
-    - `mode`: `"public"` (Global FYP preview) | `"fans-and-followers"` (Followers & Fans only)
-  - `pause_stream_output(creator_handle: str, livestream_uuid: str)`
-  - `resume_stream_output(creator_handle: str, livestream_uuid: str)`
-
-### 2. Audience Switcher Loop (`services/audience_switcher.py`)
-- Cycles:
-  1. `POST /api/livestreams/{uuid}/audience/` with `{"target": "public"}` $\rightarrow$ Sleep 15s.
-  2. `POST /api/livestreams/{uuid}/audience/` with `{"target": "fans-and-followers"}` $\rightarrow$ Sleep 5s.
-- **Response State Verification**: Verifies response JSON `{"target": mode}`. If F2F glitches or returns HTTP error, retries immediately.
-
-### 3. Video End Stream Pauser (`services/stream_pauser.py`)
-- Triggered by `POST /api/obs-event` (`event: "video_ending"`).
-- Pauses F2F output/audio.
-- Waits configurable delay ($X$ seconds).
-- Resumes F2F output once new video begins.
-
----
-
-## 🛠️ REST API Endpoints (`routes/api_routes.py`)
-
-- `POST /api/active-creator`: Updates active creator model handle.
-- `POST /api/obs-event`: Webhook receiver for 5-second video end alerts from client's PC.
-- `POST /api/audience-loop/start`: Starts 15s/5s audience toggle loop for creator.
-- `POST /api/audience-loop/stop`: Stops 15s/5s audience toggle loop.
-- `WebSocket /ws/dock`: Real-time telemetry feed for OBS Dock UI.
+- `GET /api/unreplied-fans`: Returns list of fans currently waiting for a reply.
+- `POST /api/obs-event`: Webhook receiver for 5-second video end alerts from Windows VPS nodes.
+- `POST /api/live/chat`: Dispatches a live stream comment on behalf of the creator (e.g. in Dutch).
+- `POST /api/live/audience`: Toggles audience target between `public` and `fans-and-followers`.
