@@ -146,5 +146,5 @@ async def startup_event():
     asyncio.create_task(client.start_fyp_loop(global_sec=15, followers_sec=5))
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting FastAPI Server on http://127.0.0.1:8000 ...")
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True, app_dir=os.path.dirname(__file__))
+    logger.info("🚀 Starting FastAPI Server on http://0.0.0.0:8000 ...")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False, app_dir=os.path.dirname(__file__))

@@ -140,27 +140,22 @@ def test_webhook_clicked(props, prop):
     send_webhook_async("/api/obs-event", payload)
     return True
 
-def get_target_source():
-    # If user selected a specific media source
-    if media_source_name:
-        return obs.obs_get_source_by_name(media_source_name)
-
-    # Otherwise auto-detect ANY source that has a media duration
-    target = None
-    sources = obs.obs_enum_sources()
-    if sources:
-        for source in sources:
-            duration = obs.obs_source_media_get_duration(source)
-            if duration > 0:
-                obs.obs_source_addref(source)
-                target = source
-                break
-        obs.source_list_release(sources)
-    return target
-
 def check_playback_tick():
     global last_trigger_time, last_telemetry_time
-    source = get_target_source()
+    source = None
+    is_lookup = False
+
+    if media_source_name:
+        source = obs.obs_get_source_by_name(media_source_name)
+        is_lookup = True
+    else:
+        sources = obs.obs_enum_sources()
+        if sources:
+            for s in sources:
+                if obs.obs_source_media_get_duration(s) > 0:
+                    source = s
+                    break
+
     if not source:
         return
 
@@ -200,7 +195,8 @@ def check_playback_tick():
                     }
                     send_webhook_async("/api/obs-event", payload)
     finally:
-        obs.obs_source_release(source)
+        if is_lookup and source:
+            obs.obs_source_release(source)
 
 def script_load(settings):
     print("🚀 [F2F Plugin] Script Loaded natively in OBS Studio.")

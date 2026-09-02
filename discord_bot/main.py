@@ -55,9 +55,15 @@ class ChatBridgeBot(commands.Bot):
         logger.info("Loading Bridge Service Cache...")
         await self.bridge_service.reload_cache()
 
-        logger.info("Adding Cogs: OwnerCommands & F2FAutomation...")
+        logger.info("Adding Cogs: OwnerCommands, F2FAutomation & LiveStreamController...")
         await self.add_cog(OwnerCommands(self, self.bridge_service))
         await self.add_cog(F2FAutomation(self, self.campaign_service))
+        try:
+            from cogs.live_stream_controller import LiveStreamControllerCog
+            await self.add_cog(LiveStreamControllerCog(self))
+            logger.info("Loaded LiveStreamControllerCog successfully.")
+        except Exception as e:
+            logger.error(f"Error loading LiveStreamControllerCog: {e}")
 
         logger.info("Syncing Slash Command Tree with Discord...")
         try:

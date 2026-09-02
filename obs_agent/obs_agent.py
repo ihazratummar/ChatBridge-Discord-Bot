@@ -3,9 +3,11 @@ import json
 import time
 import logging
 import asyncio
+import argparse
 from aiohttp import web
 import requests
 import threading
+import uuid
 
 # Configure logging
 logging.basicConfig(
@@ -15,21 +17,46 @@ logging.basicConfig(
 logger = logging.getLogger("OBSAgent")
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+BASE_VIDEOS_DIR = os.path.join(os.path.dirname(__file__), "videos")
+os.makedirs(BASE_VIDEOS_DIR, exist_ok=True)
+
+# Parse command-line arguments for multi-instance support
+parser = argparse.ArgumentParser(description="F2F OBS Agent Multi-Instance Server")
+parser.add_argument("--creator", default=os.getenv("CREATOR", "xsophiex"), help="Creator username (e.g. xsophiex)")
+parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8080")), help="HTTP server port")
+parser.add_argument("--obs-port", type=int, default=int(os.getenv("OBS_PORT", "4455")), help="OBS WebSocket port")
+parser.add_argument("--obs-password", default=os.getenv("OBS_PASSWORD", ""), help="OBS WebSocket password")
+args, _ = parser.parse_known_args()
+
+# Model-specific video folder (e.g. videos/xsophiex/ or fallback to videos/)
+CREATOR_VIDEOS_DIR = os.path.join(BASE_VIDEOS_DIR, args.creator)
+if os.path.exists(CREATOR_VIDEOS_DIR):
+    VIDEOS_DIR = CREATOR_VIDEOS_DIR
+else:
+    VIDEOS_DIR = BASE_VIDEOS_DIR
 
 def load_config():
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {
+    cfg = {
         "obs_host": "127.0.0.1",
-        "obs_port": 4455,
-        "obs_password": "",
-        "selected_creator": "xsophiex",
-        "creators": ["xsophiex", "chantalkuyt", "aylen", "sophie"],
+        "obs_port": args.obs_port,
+        "obs_password": args.obs_password,
+        "selected_creator": args.creator,
+        "creators": ["xsophiex", "chantalkuyt", "aylen", "sophie", "zoelynn", "chantalkuytmistress"],
         "pause_trigger_seconds": 5.0,
-        "pause_duration_seconds": 3.0,
+        "pause_duration_seconds": 10.0,
         "vps_server_url": "http://localhost:8000"
     }
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                cfg.update(saved)
+                # Override with CLI args if specified
+                cfg["selected_creator"] = args.creator
+                cfg["obs_port"] = args.obs_port
+        except Exception:
+            pass
+    return cfg
 
 def save_config(cfg):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -41,7 +68,8 @@ camera_event_state = {
     "action": "none",
     "event_id": 0,
     "pause_delay": 10.0,
-    "timestamp": 0
+    "timestamp": 0,
+    "chat_message": ""
 }
 
 def broadcast_ws_event(payload: dict):
@@ -225,6 +253,165 @@ class OBSAgentManager:
             daemon=True
         ).start()
 
+    def list_available_videos(self):
+        videos = []
+        if os.path.exists(VIDEOS_DIR):
+            for f in os.listdir(VIDEOS_DIR):
+                if f.lower().endswith((".mp4", ".mov", ".mkv", ".avi", ".webm")):
+                    videos.append(f)
+        return sorted(videos)
+
+    def switch_video(self, video_name: str):
+        if not self.is_connected or not self.obs_client:
+            self.connect_obs()
+            if not self.is_connected:
+                return {"success": False, "error": "Not connected to OBS"}
+
+        video_path = os.path.join(VIDEOS_DIR, video_name)
+        if not os.path.exists(video_path):
+            return {"success": False, "error": f"Video file '{video_name}' not found in {VIDEOS_DIR}"}
+
+        try:
+            input_name = self.current_media_input or self.find_active_media_input() or "Media"
+            self.obs_client.set_input_settings(
+                input_name,
+                {"local_file": video_path},
+                overlay=True
+            )
+            self.last_triggered_time = time.time()
+            logger.info(f"🎬 Successfully switched OBS Media source '{input_name}' to: {video_name}")
+            return {"success": True, "active_video": video_name, "input_name": input_name}
+        except Exception as e:
+            logger.error(f"Failed to switch video: {e}")
+            return {"success": False, "error": str(e)}
+
+    def start_virtual_cam(self):
+        if not self.is_connected or not self.obs_client:
+            self.connect_obs()
+        if self.obs_client:
+            try:
+                self.obs_client.start_virtual_cam()
+                logger.info("🎥 OBS Virtual Camera started!")
+                return {"success": True, "virtual_cam": "running"}
+            except Exception as e:
+                logger.error(f"Error starting virtual cam: {e}")
+                return {"success": False, "error": str(e)}
+        return {"success": False, "error": "OBS not connected"}
+
+    def stop_virtual_cam(self):
+        if self.obs_client:
+            try:
+                self.obs_client.stop_virtual_cam()
+                logger.info("⏹️ OBS Virtual Camera stopped.")
+                return {"success": True, "virtual_cam": "stopped"}
+            except Exception as e:
+                logger.error(f"Error stopping virtual cam: {e}")
+                return {"success": False, "error": str(e)}
+        return {"success": False, "error": "OBS not connected"}
+
+    def find_chrome_profile_directory(self) -> str:
+        """Auto-detects Chrome profile folder (e.g. 'Profile 1') for the model from Chrome's Local State."""
+        local_state_path = os.path.expanduser("~/.config/google-chrome/Local State")
+        if os.path.exists(local_state_path):
+            try:
+                with open(local_state_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    info_cache = data.get("profile", {}).get("info_cache", {})
+                    for prof_dir, prof_info in info_cache.items():
+                        name = prof_info.get("name", "").lower()
+                        user_name = prof_info.get("user_name", "").lower()
+                        if self.active_creator.lower() in name or self.active_creator.lower() in user_name:
+                            logger.info(f"🔍 Found Chrome Profile '{prof_dir}' matching creator @{self.active_creator}")
+                            return prof_dir
+            except Exception as e:
+                logger.debug(f"Profile lookup note: {e}")
+        return "Default"
+
+    def ensure_browser_open(self):
+        """Automatically launches Google Chrome to F2F Live page with the model's dedicated profile."""
+        try:
+            import subprocess
+            import platform
+            system = platform.system()
+            target_url = "https://f2f.com/live/"
+            prof_dir_name = self.find_chrome_profile_directory()
+
+            if system == "Darwin":  # macOS
+                subprocess.Popen(["open", "-a", "Google Chrome", target_url])
+                logger.info(f"🌐 Opened Google Chrome for @{self.active_creator} on macOS")
+            elif system == "Linux":  # Linux Ubuntu VPS
+                env = os.environ.copy()
+                if "DISPLAY" not in env:
+                    env["DISPLAY"] = ":0"
+                cmd = [
+                    "google-chrome",
+                    target_url,
+                    f"--profile-directory={prof_dir_name}",
+                    "--no-sandbox",
+                    "--use-fake-ui-for-media-stream",
+                    "--no-first-run",
+                    "--no-default-browser-check"
+                ]
+                subprocess.Popen(cmd, env=env)
+                logger.info(f"🌐 Opened Google Chrome for @{self.active_creator} (Profile: '{prof_dir_name}') on DISPLAY=:0")
+            elif system == "Windows":
+                os.system(f'start chrome --profile-directory="{prof_dir_name}" {target_url}')
+        except Exception as e:
+            logger.warning(f"Note on browser launch: {e}")
+
+    def trigger_go_live(self, title: str = "", message: str = "", tip_goal: str = ""):
+        self.ensure_browser_open()
+        self.start_virtual_cam()
+        camera_event_state["event_id"] += 1
+        camera_event_state["action"] = "go_live"
+        camera_event_state["title"] = title
+        camera_event_state["message"] = message
+        camera_event_state["tip_goal"] = tip_goal
+        camera_event_state["timestamp"] = time.time()
+        logger.info(f"🚀 Triggered 'Go Live' for @{self.active_creator} (Title: '{title}')")
+        return {"success": True, "action": "go_live", "title": title}
+
+    def trigger_end_stream(self):
+        camera_event_state["event_id"] += 1
+        camera_event_state["action"] = "end_stream"
+        camera_event_state["timestamp"] = time.time()
+        self.stop_virtual_cam()
+        logger.info(f"🛑 Triggered 'End Stream' for @{self.active_creator}")
+        return {"success": True, "action": "end_stream"}
+
+    def send_live_chat(self, text: str):
+        camera_event_state["event_id"] += 1
+        camera_event_state["action"] = "send_chat"
+        camera_event_state["chat_message"] = text
+        camera_event_state["timestamp"] = time.time()
+        broadcast_ws_event({
+            "action": "send_chat",
+            "text": text,
+            "creator": self.active_creator
+        })
+        logger.info(f"💬 Dispatched live chat to F2F: '{text}'")
+        return {"success": True, "message": text}
+
+    def delete_live_chat(self, message_id: str = "", text: str = "", username: str = ""):
+        camera_event_state["event_id"] += 1
+        camera_event_state["action"] = "delete_chat"
+        camera_event_state["delete_message_id"] = message_id
+        camera_event_state["delete_text"] = text
+        camera_event_state["delete_username"] = username
+        camera_event_state["timestamp"] = time.time()
+        broadcast_ws_event({
+            "action": "delete_chat",
+            "message_id": message_id,
+            "text": text,
+            "username": username,
+            "creator": self.active_creator
+        })
+        logger.info(f"🗑️ Dispatched message deletion to F2F: id='{message_id}', text='{text}'")
+        return {"success": True, "action": "delete_chat", "message_id": message_id}
+
+# In-memory queue for incoming chats from browser
+incoming_chat_queue = []
+
 # Web Server & OBS Dock API Routes
 agent = OBSAgentManager()
 
@@ -238,9 +425,79 @@ async def handle_get_config(request):
 async def handle_camera_event(request):
     return web.json_response(camera_event_state, headers={
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
         "Access-Control-Allow-Headers": "*"
     })
+
+async def handle_list_videos(request):
+    videos = agent.list_available_videos()
+    return web.json_response({"videos": videos, "count": len(videos)})
+
+async def handle_switch_video(request):
+    body = await request.json()
+    video_name = body.get("video_name")
+    if not video_name:
+        return web.json_response({"success": False, "error": "No video_name provided"}, status=400)
+    result = agent.switch_video(video_name)
+    return web.json_response(result)
+
+async def handle_go_live(request):
+    body = await request.json() if request.can_read_body else {}
+    title = body.get("title", "")
+    msg = body.get("message", "")
+    goal = body.get("tip_goal", "")
+    res = agent.trigger_go_live(title=title, message=msg, tip_goal=goal)
+    return web.json_response(res)
+
+async def handle_end_stream(request):
+    res = agent.trigger_end_stream()
+    return web.json_response(res)
+
+async def handle_virtual_cam_start(request):
+    res = agent.start_virtual_cam()
+    return web.json_response(res)
+
+async def handle_virtual_cam_stop(request):
+    res = agent.stop_virtual_cam()
+    return web.json_response(res)
+
+async def handle_send_chat(request):
+    body = await request.json()
+    msg = body.get("message") or body.get("text")
+    if not msg:
+        return web.json_response({"success": False, "error": "No message provided"}, status=400)
+    res = agent.send_live_chat(msg)
+    return web.json_response(res)
+
+async def handle_delete_chat(request):
+    body = await request.json()
+    msg_id = body.get("message_id", "")
+    text = body.get("text", "")
+    username = body.get("username", "")
+    res = agent.delete_live_chat(message_id=msg_id, text=text, username=username)
+    return web.json_response(res)
+
+async def handle_incoming_chat(request):
+    body = await request.json()
+    chat_item = {
+        "id": body.get("id") or str(uuid.uuid4())[:8],
+        "creator": body.get("creator") or agent.active_creator,
+        "username": body.get("username", "Fan"),
+        "text": body.get("text", ""),
+        "type": body.get("type", "chat"),
+        "tip_amount": body.get("tip_amount", 0),
+        "timestamp": time.time()
+    }
+    incoming_chat_queue.append(chat_item)
+    if len(incoming_chat_queue) > 100:
+        incoming_chat_queue.pop(0)
+    logger.info(f"📥 Received live chat from F2F for @{chat_item['creator']}: [{chat_item['username']}] {chat_item['text']}")
+    return web.json_response({"status": "received", "chat": chat_item}, headers={"Access-Control-Allow-Origin": "*"})
+
+async def handle_get_incoming_chats(request):
+    since = float(request.query.get("since", 0))
+    new_chats = [c for c in incoming_chat_queue if c["timestamp"] > since]
+    return web.json_response({"chats": new_chats, "timestamp": time.time()}, headers={"Access-Control-Allow-Origin": "*"})
 
 async def handle_set_creator(request):
     body = await request.json()
@@ -299,21 +556,44 @@ async def start_background_tasks(app):
     except asyncio.CancelledError:
         pass
 
+async def handle_obs_event(request):
+    body = await request.json() if request.can_read_body else {}
+    event_type = body.get("event", "video_ending")
+    remaining_sec = float(body.get("remaining_sec", 5.0))
+    media_name = body.get("media_name", "Media")
+    logger.info(f"🚨 [OBS PLUGIN EVENT] Received '{event_type}' for @{agent.active_creator} ({remaining_sec:.1f}s remaining on '{media_name}')")
+    if event_type == "video_ending":
+        agent.trigger_video_end_event(remaining_sec)
+    return web.json_response({"success": True, "event": event_type}, headers={"Access-Control-Allow-Origin": "*"})
+
 def init_app():
     app = web.Application()
     app.cleanup_ctx.append(start_background_tasks)
     app.router.add_get("/", handle_dock)
+    app.router.add_get("/dock", handle_dock)
     app.router.add_get("/dock_panel.html", handle_dock)
     app.router.add_get("/api/status", handle_status)
     app.router.add_get("/api/config", handle_get_config)
     app.router.add_get("/api/camera-event", handle_camera_event)
-    app.router.add_post("/api/set-creator", handle_set_creator)
-    app.router.add_get("/ws", handle_ws)
+    app.router.add_get("/api/videos", handle_list_videos)
+    app.router.add_post("/api/switch-video", handle_switch_video)
+    app.router.add_post("/api/stream/go-live", handle_go_live)
+    app.router.add_post("/api/stream/end", handle_end_stream)
+    app.router.add_post("/api/virtual-cam/start", handle_virtual_cam_start)
+    app.router.add_post("/api/virtual-cam/stop", handle_virtual_cam_stop)
+    app.router.add_post("/api/send-chat", handle_send_chat)
+    app.router.add_post("/api/stream/send-chat", handle_send_chat)
+    app.router.add_post("/api/stream/delete-chat", handle_delete_chat)
+    app.router.add_post("/api/incoming-chat", handle_incoming_chat)
+    app.router.add_get("/api/stream/incoming-chats", handle_get_incoming_chats)
+    app.router.add_post("/api/obs-event", handle_obs_event)
+    app.router.add_post("/api/creator", handle_set_creator)
     app.router.add_get("/f2f_camera_controller.user.js", handle_userscript)
+    app.router.add_get("/ws", handle_ws)
     return app
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting OBS Agent Server on port 8080...")
+    logger.info(f"🚀 Starting OBS Agent Server for @{args.creator} on port {args.port} (OBS WebSocket port: {args.obs_port})...")
     agent.connect_obs()
     app = init_app()
-    web.run_app(app, host="0.0.0.0", port=8080)
+    web.run_app(app, host="0.0.0.0", port=args.port)

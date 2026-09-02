@@ -1,6 +1,11 @@
 import logging
 import uuid
 import asyncio
+try:
+    import certifi
+    CA_FILE = certifi.where()
+except ImportError:
+    CA_FILE = None
 from motor.motor_asyncio import AsyncIOMotorClient
 
 logger = logging.getLogger("ChatBridge.MongoDatabase")
@@ -14,7 +19,10 @@ class MongoDatabaseManager:
         self.db = None
 
     async def connect(self):
-        self.client = AsyncIOMotorClient(self.uri)
+        kwargs = {}
+        if CA_FILE:
+            kwargs["tlsCAFile"] = CA_FILE
+        self.client = AsyncIOMotorClient(self.uri, **kwargs)
         self.db = self.client[self.db_name]
         await self.db.bridge_members.create_index([("group_id", 1)])
         await self.db.bridge_members.create_index([("channel_id", 1)])
