@@ -9,7 +9,7 @@
 // @grant        unsafeWindow
 // @connect      127.0.0.1
 // @connect      localhost
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 (function() {
@@ -18,7 +18,7 @@
     const pageWindow = unsafeWindow;
     const pageDoc = pageWindow.document;
 
-    console.log("%c[F2F-OBS] v3.5 Instant Camera Toggle & Chat Active", "color: #10b981; font-weight: bold; font-size: 16px;");
+    console.log("%c[F2F-OBS] v3.6 Pure WebSocket Chat & Camera Controller Active", "color: #10b981; font-weight: bold; font-size: 16px;");
 
     // Dynamic Port Discovery
     var agentPort = 8081;
@@ -30,7 +30,80 @@
     var activeChannelName = "";
     var seenMessageIds = new Set();
 
-    // ─── Direct WebSocket Hook ────────────────────────────────────
+    // ─── Pure WebSocket Chat Interceptor (No DOM Scraping) ────────
+    function attachLiveChatListener(ws) {
+        if (!ws || ws.__f2f_chat_attached) return;
+        ws.__f2f_chat_attached = true;
+        liveSocket = ws;
+        console.log("%c[F2F-OBS] ⚡ Hooked F2F Live WebSocket Successfully!", "color: #3b82f6; font-weight: bold; font-size: 14px;");
+
+        ws.addEventListener("message", function(event) {
+            try {
+                var data = event.data;
+                if (typeof data !== "string") return;
+
+                if (data.startsWith("42")) {
+                    var jsonStart = data.indexOf("[");
+                    if (jsonStart === -1) return;
+                    var parsed = JSON.parse(data.substring(jsonStart));
+                    var eventName = parsed[0];
+                    var payload = parsed[1];
+
+                    // 1. Live Chat Comment Sent
+                    if (eventName === "livestream:chat:message:sent" && payload) {
+                        var msgId = payload.id || "";
+                        var content = (payload.content || payload.message || "").trim();
+                        var userObj = payload.user || {};
+                        var username = (userObj.username || userObj.display_name || payload.username || "Fan").trim();
+                        var tipAmount = payload.amount || 0;
+                        var isTip = tipAmount > 0 || (payload.type === "tip");
+
+                        if (msgId.includes("#")) {
+                            activeChannelName = msgId.split("#")[0];
+                        }
+
+                        var msgHash = msgId || (username + ":" + content);
+                        if (!seenMessageIds.has(msgHash)) {
+                            seenMessageIds.add(msgHash);
+                            console.log("%c[F2F-OBS] 📥 [PURE WS CHAT] " + username + ": " + content, "color: #10b981; font-weight: bold; font-size: 14px;");
+
+                            GM_xmlhttpRequest({
+                                method: "POST",
+                                url: "http://127.0.0.1:" + agentPort + "/api/incoming-chat",
+                                headers: { "Content-Type": "application/json" },
+                                data: JSON.stringify({
+                                    id: msgId,
+                                    username: username,
+                                    text: content,
+                                    type: isTip ? "tip" : "chat",
+                                    tip_amount: tipAmount
+                                })
+                            });
+                        }
+                    } 
+                    // 2. Live Stream Tip Received
+                    else if (eventName === "livestream:chat:tip:received" && payload) {
+                        var tipUser = (payload.username || payload.display_name || "Fan").trim();
+                        var tipAmt = payload.amount || payload.total_tip_revenue || 0;
+                        console.log("%c[F2F-OBS] 💸 [PURE WS TIP] " + tipUser + ": €" + tipAmt, "color: #f59e0b; font-weight: bold; font-size: 14px;");
+                        GM_xmlhttpRequest({
+                            method: "POST",
+                            url: "http://127.0.0.1:" + agentPort + "/api/incoming-chat",
+                            headers: { "Content-Type": "application/json" },
+                            data: JSON.stringify({
+                                id: payload.id || "",
+                                username: tipUser,
+                                text: "€" + tipAmt,
+                                type: "tip",
+                                tip_amount: tipAmt
+                            })
+                        });
+                    }
+                }
+            } catch(e) {}
+        });
+    }
+
     try {
         if (pageWindow.WebSocket && !pageWindow.__f2f_ws_hooked) {
             pageWindow.__f2f_ws_hooked = true;
@@ -40,69 +113,7 @@
                     try {
                         var url = args[0];
                         if (typeof url === "string" && (url.includes("socket.f2f.net") || url.includes("f2f.com") || url.includes("socket.io"))) {
-                            console.log("%c[F2F-OBS] ⚡ Hooked F2F Live WebSocket: " + url, "color: #3b82f6; font-weight: bold;");
-                            liveSocket = ws;
-
-                            ws.addEventListener("message", function(event) {
-                                try {
-                                    var data = event.data;
-                                    if (typeof data !== "string") return;
-
-                                    if (data.startsWith("42")) {
-                                        var parsed = JSON.parse(data.substring(2));
-                                        var eventName = parsed[0];
-                                        var payload = parsed[1];
-
-                                        if (eventName === "livestream:chat:message:sent" && payload) {
-                                            var msgId = payload.id || "";
-                                            var content = payload.content || payload.message || "";
-                                            var userObj = payload.user || {};
-                                            var username = userObj.username || userObj.display_name || payload.username || "Fan";
-                                            var tipAmount = payload.amount || 0;
-                                            var isTip = tipAmount > 0 || (payload.type === "tip");
-
-                                            if (msgId.includes("#")) {
-                                                activeChannelName = msgId.split("#")[0];
-                                            }
-
-                                            var msgHash = msgId || (username + ":" + content);
-                                            if (!seenMessageIds.has(msgHash)) {
-                                                seenMessageIds.add(msgHash);
-                                                console.log("%c[F2F-OBS] 📥 [WS CHAT] " + username + ": " + content, "color: #10b981; font-weight: bold;");
-
-                                                GM_xmlhttpRequest({
-                                                    method: "POST",
-                                                    url: "http://127.0.0.1:" + agentPort + "/api/incoming-chat",
-                                                    headers: { "Content-Type": "application/json" },
-                                                    data: JSON.stringify({
-                                                        id: msgId,
-                                                        username: username,
-                                                        text: content,
-                                                        type: isTip ? "tip" : "chat",
-                                                        tip_amount: tipAmount
-                                                    })
-                                                });
-                                            }
-                                        } else if (eventName === "livestream:chat:tip:received" && payload) {
-                                            var tipUser = payload.username || payload.display_name || "Fan";
-                                            var tipAmt = payload.amount || payload.total_tip_revenue || 0;
-                                            console.log("%c[F2F-OBS] 💸 [WS TIP] " + tipUser + ": €" + tipAmt, "color: #f59e0b; font-weight: bold;");
-                                            GM_xmlhttpRequest({
-                                                method: "POST",
-                                                url: "http://127.0.0.1:" + agentPort + "/api/incoming-chat",
-                                                headers: { "Content-Type": "application/json" },
-                                                data: JSON.stringify({
-                                                    id: payload.id || "",
-                                                    username: tipUser,
-                                                    text: "€" + tipAmt,
-                                                    type: "tip",
-                                                    tip_amount: tipAmt
-                                                })
-                                            });
-                                        }
-                                    }
-                                } catch(e) {}
-                            });
+                            attachLiveChatListener(ws);
                         }
                     } catch(e) {}
                     return ws;
@@ -110,50 +121,6 @@
             });
         }
     } catch(e) {}
-
-    // ─── Precision DOM Chat Scraper ───────────────────────────────
-    function scanLiveChatDOM() {
-        var rootArea = pageDoc.body;
-        var allElements = Array.from(rootArea.querySelectorAll("p, div, span, li"));
-        for (var el of allElements) {
-            var rawText = (el.innerText || el.textContent || "").trim();
-            if (!rawText || rawText.length < 3 || rawText.length > 500) continue;
-            if (rawText.endsWith("joined") || rawText === "Chat" || rawText === "Follower" || rawText === "Subscriber" || rawText.includes("OBS Sync") || rawText.includes("security will suffer")) continue;
-
-            var lines = rawText.split("\n").map(function(l) { return l.trim(); }).filter(function(l) { return l.length > 0; });
-            var username = "";
-            var messageText = "";
-
-            if (lines.length >= 2 && lines[0].length < 35) {
-                username = lines[0].replace("Follower", "").replace("Subscriber", "").trim();
-                messageText = lines.slice(1).join(" ").replace("Follower", "").replace("Subscriber", "").trim();
-            } else if (rawText.includes(":") && !rawText.startsWith("http")) {
-                var parts = rawText.split(":");
-                username = parts[0].trim();
-                messageText = parts.slice(1).join(":").trim();
-            }
-
-            if (username && messageText && username.length < 35 && messageText.length > 0 && !messageText.endsWith("joined") && messageText !== username) {
-                var hash = username + ":" + messageText;
-                if (!seenMessageIds.has(hash)) {
-                    seenMessageIds.add(hash);
-                    console.log("%c[F2F-OBS] 💬 [DOM CHAT CAPTURED] " + username + ": " + messageText, "color: #10b981; font-weight: bold; font-size: 14px;");
-
-                    GM_xmlhttpRequest({
-                        method: "POST",
-                        url: "http://127.0.0.1:" + agentPort + "/api/incoming-chat",
-                        headers: { "Content-Type": "application/json" },
-                        data: JSON.stringify({
-                            username: username,
-                            text: messageText,
-                            type: messageText.includes("€") ? "tip" : "chat"
-                        })
-                    });
-                }
-            }
-        }
-    }
-    setInterval(scanLiveChatDOM, 800);
 
     // ─── Badge UI ─────────────────────────────────────────────────
     let badge = null;

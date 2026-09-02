@@ -37,6 +37,10 @@ class F2FLiveSocketClient:
         self.incoming_chat_queue: List[Dict] = []
         self.chat_seq_counter: int = 0
         self.seen_message_ids: set = set()
+        self.chat_token: str = ""
+        self.last_raw_packet: str = ""
+        self.last_error: str = ""
+        self.last_packet_time: float = 0
 
     async def get_live_details_and_token(self) -> tuple:
         """
@@ -70,24 +74,29 @@ class F2FLiveSocketClient:
         except Exception as e:
             logger.debug(f"Live details fetch error for @{self.creator_handle}: {e}")
 
-        # 2. Fetch Socket Token (Prioritize creator-specific room token)
-        token_endpoints = [
-            f"https://f2f.com/api/creators/{self.creator_handle}/livestream/chat/token",
-            f"https://f2f.com/api/socket/token/"
-        ]
+        # 2. Fetch Official F2F Socket Token (Required for Socket.IO authentication)
+        socket_url = "https://f2f.com/api/socket/token/"
+        try:
+            resp = await creator_client.session.get(socket_url, headers=headers, cookies=cookies)
+            if resp.status_code == 200:
+                data = resp.json()
+                t = data.get("token")
+                if t:
+                    token = t
+                    logger.info(f"🔑 [@{self.creator_handle}] Retrieved Live Chat JWT Socket Token from socket/token!")
+        except Exception as e:
+            logger.debug(f"Token fetch exception for @{self.creator_handle}: {e}")
 
-        for url in token_endpoints:
-            try:
-                resp = await creator_client.session.get(url, headers=headers, cookies=cookies)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    t = data.get("token")
-                    if t:
-                        token = t
-                        logger.info(f"🔑 [@{self.creator_handle}] Retrieved Live Chat JWT Socket Token from {url.split('/')[-2] or url.split('/')[-1]}!")
-                        break
-            except Exception as e:
-                logger.debug(f"Token fetch exception for @{self.creator_handle}: {e}")
+        # 3. Fetch Creator Room Chat Token (Required for livestream:chat:user:join)
+        chat_token_url = f"https://f2f.com/api/creators/{self.creator_handle}/livestream/chat/token"
+        try:
+            resp_chat = await creator_client.session.get(chat_token_url, headers=headers, cookies=cookies)
+            if resp_chat.status_code == 200:
+                self.chat_token = resp_chat.json().get("token", "")
+                if self.chat_token:
+                    logger.info(f"🔑 [@{self.creator_handle}] Retrieved Creator Chat Room Token for room joining!")
+        except Exception as e:
+            logger.debug(f"Chat token fetch exception for @{self.creator_handle}: {e}")
 
         return channel_name, token
 
@@ -135,7 +144,15 @@ class F2FLiveSocketClient:
                 cookie_str = "; ".join([f"{k}={v}" for k, v in creator_client._get_cookies().items()])
                 headers = {
                     "Origin": "https://f2f.com",
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Referer": f"https://f2f.com/{self.creator_handle}/livestream",
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+                    "Accept-Language": "en-IN,en;q=0.9,bn-IN;q=0.8,bn;q=0.7,en-GB;q=0.6,en-US;q=0.5",
+                    "Sec-Ch-Ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+                    "Sec-Ch-Ua-Mobile": "?0",
+                    "Sec-Ch-Ua-Platform": '"macOS"',
+                    "Sec-Fetch-Dest": "empty",
+                    "Sec-Fetch-Mode": "cors",
+                    "Sec-Fetch-Site": "same-origin",
                     "Cookie": cookie_str
                 }
 
@@ -157,16 +174,34 @@ class F2FLiveSocketClient:
                     
                     # 3. Receive auth confirmation
                     auth_confirm = await ws.receive_str()
-                    logger.info(f"🎉 [@{self.creator_handle}] Live Chat WebSocket AUTHENTICATED! Response: {auth_confirm}")
+                    if not auth_confirm.startswith("40"):
+                        logger.error(f"❌ [@{self.creator_handle}] WebSocket Auth rejected by F2F server: {auth_confirm}")
+                        self.is_connected = False
+                        await asyncio.sleep(5)
+                        continue
+
+                    logger.info(f"🎉 [@{self.creator_handle}] Live Chat WebSocket AUTHENTICATED! (sid: {auth_confirm[:30]})")
                     self.is_connected = True
 
-                    # 4. Process incoming socket frames
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            await self._handle_incoming_packet(msg.data)
-                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                            logger.warning(f"⚠️ [@{self.creator_handle}] Socket closed or error: {msg}")
-                            break
+                    # 4. Join the Creator's Live Chat Room via official F2F "livestream:chat:user:join" packet!
+                    if self.active_channel_name and self.chat_token:
+                        join_packet = "42" + json.dumps(["livestream:chat:user:join", self.active_channel_name, self.chat_token])
+                        await ws.send_str(join_packet)
+                        logger.info(f"🚪 [@{self.creator_handle}] Dispatched 'livestream:chat:user:join' to room '{self.active_channel_name}'!")
+
+                    # 5. Launch background stream monitor task to auto-join if creator goes live mid-session
+                    monitor_task = asyncio.create_task(self._stream_monitor_loop(ws))
+
+                    try:
+                        # 6. Process incoming socket frames
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                await self._handle_incoming_packet(msg.data)
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                logger.warning(f"⚠️ [@{self.creator_handle}] Socket closed or error: {msg}")
+                                break
+                    finally:
+                        monitor_task.cancel()
 
             except asyncio.CancelledError:
                 break
@@ -177,8 +212,24 @@ class F2FLiveSocketClient:
             if self.is_running:
                 await asyncio.sleep(5)
 
+    async def _stream_monitor_loop(self, ws):
+        """Continuously checks if creator goes live or switches channel while socket is connected."""
+        while not ws.closed and self.is_connected:
+            try:
+                await asyncio.sleep(10)
+                channel_name, token = await self.get_live_details_and_token()
+                if channel_name and channel_name != self.active_channel_name and self.chat_token:
+                    self.active_channel_name = channel_name
+                    join_packet = "42" + json.dumps(["livestream:chat:user:join", self.active_channel_name, self.chat_token])
+                    await ws.send_str(join_packet)
+                    logger.info(f"🚪 [@{self.creator_handle}] Auto-joined newly started stream: '{self.active_channel_name}'!")
+            except Exception as e:
+                logger.debug(f"Stream monitor tick error: {e}")
+
     async def _handle_incoming_packet(self, data: str):
         """Parses Engine.io / Socket.io packets from F2F Live with bulletproof regex/json index search."""
+        self.last_raw_packet = data[:300]
+        self.last_packet_time = time.time()
         try:
             # 1. Keepalive ping/pong
             if data.startswith("2"):
@@ -209,18 +260,17 @@ class F2FLiveSocketClient:
                             item = el
                             break
 
-                # Case A: Chat Message Event
-                if ("message" in event_name or "chat" in event_name) and "delete" not in event_name and item:
+                # Case A: Chat Message Event (Exclude system join/leave events)
+                if ("message" in event_name or "chat" in event_name) and "delete" not in event_name and "joined" not in event_name and "left" not in event_name and item:
                     msg_id = item.get("id") or str(uuid.uuid4())[:8]
-                    content = item.get("content") or item.get("message") or item.get("text") or ""
-                    if not content:
+                    content = (item.get("content") or item.get("message") or item.get("text") or "").strip()
+                    if not content or "joined" in content.lower() or item.get("type") in ("joined", "system"):
                         return
 
                     user_obj = item.get("user") or {}
                     username = (
-                        (user_obj.get("username") if isinstance(user_obj, dict) else None) or 
                         (user_obj.get("display_name") if isinstance(user_obj, dict) else None) or 
-                        item.get("username") or 
+                        (user_obj.get("username") if isinstance(user_obj, dict) else None) or 
                         item.get("display_name") or 
                         "Fan"
                     )
@@ -282,7 +332,7 @@ class F2FLiveSocketClient:
             return False
 
         channel = self.active_channel_name or self.creator_handle
-        payload = ["livestream:chat:message:send", [channel, text]]
+        payload = ["livestream:chat:message:send", channel, text]
         packet = "42" + json.dumps(payload)
         
         try:
@@ -300,7 +350,7 @@ class F2FLiveSocketClient:
             return False
 
         channel = self.active_channel_name or self.creator_handle
-        payload = ["livestream:chat:message:delete", [channel, str(message_id)]]
+        payload = ["livestream:chat:message:delete", channel, str(message_id)]
         packet = "42" + json.dumps(payload)
 
         try:

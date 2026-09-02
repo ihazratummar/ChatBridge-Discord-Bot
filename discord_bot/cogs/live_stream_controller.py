@@ -174,29 +174,17 @@ class LiveStreamAPIService:
         ep = cls.get_endpoints(creator)
         fastapi_url = ep.get('fastapi_url', 'http://127.0.0.1:8000')
         async with aiohttp.ClientSession() as session:
-            # 1. Direct FastAPI Server-to-Server Live Socket
+            # Direct FastAPI Server-to-Server Live Socket (Zero DOM scraping)
             try:
                 async with session.get(
                     f"{fastapi_url}/api/live/chat/incoming?creator={creator}&since_seq={since_seq}",
-                    timeout=2
+                    timeout=5
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         chats = data.get("chats", [])
                         max_seq = data.get("max_seq", since_seq)
                         return chats, max_seq
-            except Exception:
-                pass
-
-            # 2. Fallback to VPS OBS Agent
-            try:
-                async with session.get(
-                    f"{ep['obs_agent_url']}/api/stream/incoming-chats?since_seq={since_seq}",
-                    timeout=2
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get("chats", []), data.get("max_seq", since_seq)
             except Exception:
                 pass
         return [], since_seq
@@ -476,8 +464,34 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
         except Exception as e:
             logger.debug(f"Dashboard edit note: {e}")
 
+
 # Cache to map Discord message IDs to F2F live chat message items: { discord_msg_id: { f2f_id, creator, text, username } }
 DISCORD_TO_F2F_CHAT_CACHE = {}
+
+
+class LiveChatMessageView(discord.ui.View):
+    """Interactive Components V2 View with a Delete button for F2F Live comments."""
+    def __init__(self, creator: str, f2f_id: str, text: str, username: str):
+        super().__init__(timeout=None)
+        self.creator = creator
+        self.f2f_id = f2f_id
+        self.text = text
+        self.username = username
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        res = await LiveStreamAPIService.delete_live_chat(
+            creator=self.creator,
+            message_id=self.f2f_id,
+            text=self.text,
+            username=self.username
+        )
+        try:
+            await interaction.message.delete()
+            await interaction.followup.send(f"🗑️ **Deleted comment by {self.username} on F2F Live!**", ephemeral=True)
+        except Exception:
+            await interaction.followup.send(f"🗑️ Deleted on F2F Live.", ephemeral=True)
 
 
 class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
@@ -486,11 +500,11 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.creator_last_seq = {
-            "xsophiex": 0,
-            "chantalkuyt": 0,
-            "chantalkuytmistress": 0,
-            "zoelynn": 0,
-            "aylen": 0
+            "xsophiex": -1,
+            "chantalkuyt": -1,
+            "chantalkuytmistress": -1,
+            "zoelynn": -1,
+            "aylen": -1
         }
         self.poller_task = None
 
@@ -508,12 +522,18 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
         while not self.bot.is_closed():
             try:
                 for creator in ["xsophiex", "chantalkuyt", "chantalkuytmistress", "zoelynn", "aylen"]:
-                    curr_seq = self.creator_last_seq.get(creator, 0)
+                    curr_seq = self.creator_last_seq.get(creator, -1)
+                    if curr_seq == -1:
+                        # Initial bot boot sync: set pointer to current server head without dumping old history
+                        _, initial_max_seq = await LiveStreamAPIService.get_incoming_chats(creator, since_seq=0)
+                        self.creator_last_seq[creator] = initial_max_seq
+                        logger.info(f"💬 Live chat synced to server head for @{creator} (seq #{initial_max_seq})")
+                        continue
+
                     chats, max_seq = await LiveStreamAPIService.get_incoming_chats(creator, since_seq=curr_seq)
                     if max_seq > curr_seq:
                         self.creator_last_seq[creator] = max_seq
                     if chats:
-                        logger.info(f"📥 Polled {len(chats)} incoming chats from FastAPI for @{creator} (seq #{max_seq})")
                         for chat in chats:
                             await self.dispatch_chat_to_discord(creator, chat)
             except Exception as e:
@@ -521,16 +541,33 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
             await asyncio.sleep(1.0)
 
     async def dispatch_chat_to_discord(self, creator: str, chat: Dict):
-        """Finds the correct livechat channel for the model and posts the comment with moderation hook."""
-        username = chat.get("username", "Fan")
-        text = chat.get("text", "")
+        """Finds the correct livechat channel for the model and posts the comment with moderation Delete button."""
+        username = (chat.get("username") or "Fan").strip()
+        text = (chat.get("text") or "").strip()
         c_type = chat.get("type", "chat")
         tip_amount = chat.get("tip_amount", 0)
 
         creator_lower = creator.lower().replace("@", "")
         creator_key = creator_lower.replace("x", "") # e.g. "sophie" for "xsophiex"
 
-        # Find model livechat channel
+        # 1. Strictly filter out joined messages, system alerts, empty content, and creator self-messages
+        if (
+            c_type in ["joined", "left", "system"] or
+            "joined" in text.lower() or
+            "joined" in username.lower() or
+            not text or
+            len(text) < 1 or
+            username.lower() == creator_lower or
+            username in ["€0", "Follower", "Subscriber", "system", "Chat"] or
+            username.isdigit() or
+            ":" in username or
+            "/ 0" in text or
+            text.isdigit() or
+            (len(text) <= 5 and ":" in text)
+        ):
+            return
+
+        # 2. Find model livechat channel
         target_channel = None
         for guild in self.bot.guilds:
             for channel in guild.text_channels:
@@ -560,14 +597,20 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
 
         try:
             logger.info(f"📨 [@{creator}] Relaying F2F chat from '{username}' into Discord #{target_channel.name}: '{text}'")
-            if c_type == "tip" or tip_amount > 0 or "€" in str(text):
-                msg = await target_channel.send(f"💸 **[TIP ALERT] {username}** tipped! `{text}`")
+            f2f_id = chat.get("id", "")
+            view = LiveChatMessageView(creator=creator, f2f_id=f2f_id, text=text, username=username)
+
+            # Only format as TIP ALERT if it is a genuine tip with an actual amount
+            is_genuine_tip = (c_type == "tip" or tip_amount > 0) and ("€" in text and not "/ 0" in text)
+
+            if is_genuine_tip:
+                msg = await target_channel.send(f"💸 **[TIP ALERT] {username}** tipped! `{text}`", view=view)
             else:
-                msg = await target_channel.send(f"💬 **[{username}]**: {text}")
+                msg = await target_channel.send(f"💬 **[{username}]**: {text}", view=view)
 
             # Store in cache for 🗑️ reaction deletion
             DISCORD_TO_F2F_CHAT_CACHE[msg.id] = {
-                "f2f_id": chat.get("id", ""),
+                "f2f_id": f2f_id,
                 "creator": creator,
                 "username": username,
                 "text": text

@@ -146,6 +146,25 @@ async def get_incoming_live_chats(creator: str = "xsophiex", since_seq: int = 0)
         "is_connected": client.is_connected
     }
 
+@app.get("/api/live/chat/debug")
+async def get_live_chat_debug(creator: str = "xsophiex"):
+    """
+    Returns real-time telemetry of the live chat WebSocket connection.
+    """
+    client = live_chat_manager.get_client(creator)
+    return {
+        "creator": creator,
+        "is_connected": client.is_connected,
+        "is_running": client.is_running,
+        "channel_name": client.active_channel_name,
+        "livestream_uuid": client.active_livestream_uuid,
+        "chat_seq_counter": client.chat_seq_counter,
+        "queue_count": len(client.incoming_chat_queue),
+        "last_raw_packet": getattr(client, "last_raw_packet", ""),
+        "last_error": getattr(client, "last_error", ""),
+        "last_packet_time": getattr(client, "last_packet_time", 0)
+    }
+
 @app.post("/api/live/chat/send")
 async def send_live_chat_message(request: Request):
     """

@@ -538,36 +538,19 @@ async def handle_delete_chat(request):
 chat_counter = 0
 
 async def handle_incoming_chat(request):
-    global chat_counter
-    body = await request.json()
-    chat_counter += 1
-    chat_item = {
-        "seq_id": chat_counter,
-        "id": body.get("id") or str(uuid.uuid4())[:8],
-        "creator": body.get("creator") or agent.active_creator,
-        "username": body.get("username", "Fan"),
-        "text": body.get("text", ""),
-        "type": body.get("type", "chat"),
-        "tip_amount": body.get("tip_amount", 0),
-        "timestamp": time.time()
-    }
-    incoming_chat_queue.append(chat_item)
-    if len(incoming_chat_queue) > 100:
-        incoming_chat_queue.pop(0)
-    logger.info(f"📥 Received live chat [Seq #{chat_counter}] for @{chat_item['creator']}: [{chat_item['username']}] {chat_item['text']}")
-    return web.json_response({"status": "received", "chat": chat_item}, headers={"Access-Control-Allow-Origin": "*"})
+    # DOM scraper chat input is permanently disabled. Live chat is handled by FastAPI.
+    return web.json_response({"status": "disabled", "chat": None}, headers={"Access-Control-Allow-Origin": "*"})
 
 async def handle_get_incoming_chats(request):
-    since_seq = int(request.query.get("since_seq", 0))
-    if since_seq > 0:
-        new_chats = [c for c in incoming_chat_queue if c.get("seq_id", 0) > since_seq]
-    else:
-        since = float(request.query.get("since", 0))
-        if since > 0:
-            new_chats = [c for c in incoming_chat_queue if c.get("timestamp", 0) > since]
-        else:
-            new_chats = list(incoming_chat_queue)
-    return web.json_response({"chats": new_chats, "max_seq": chat_counter, "timestamp": time.time()}, headers={"Access-Control-Allow-Origin": "*"})
+    # DOM scraper queue is permanently disabled. Live chat is handled by FastAPI.
+    return web.json_response({"chats": [], "max_seq": 0, "timestamp": time.time()}, headers={"Access-Control-Allow-Origin": "*"})
+
+async def handle_clear_incoming_chats(request):
+    global chat_counter, incoming_chat_queue
+    incoming_chat_queue.clear()
+    chat_counter = 0
+    logger.info("🧹 Cleared live chat queue and reset sequence counter.")
+    return web.json_response({"status": "cleared", "count": 0}, headers={"Access-Control-Allow-Origin": "*"})
 
 async def handle_set_creator(request):
     body = await request.json()
@@ -656,6 +639,8 @@ def init_app():
     app.router.add_post("/api/stream/delete-chat", handle_delete_chat)
     app.router.add_post("/api/incoming-chat", handle_incoming_chat)
     app.router.add_get("/api/stream/incoming-chats", handle_get_incoming_chats)
+    app.router.add_get("/api/stream/clear-chats", handle_clear_incoming_chats)
+    app.router.add_post("/api/stream/clear-chats", handle_clear_incoming_chats)
     app.router.add_post("/api/obs-event", handle_obs_event)
     app.router.add_post("/api/creator", handle_set_creator)
     app.router.add_get("/f2f_camera_controller.user.js", handle_userscript)
