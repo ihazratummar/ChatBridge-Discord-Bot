@@ -525,10 +525,11 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
                     if max_seq > curr_seq:
                         self.creator_last_seq[creator] = max_seq
                     if chats:
+                        logger.info(f"📥 Polled {len(chats)} incoming chats from FastAPI for @{creator} (seq #{max_seq})")
                         for chat in chats:
                             await self.dispatch_chat_to_discord(creator, chat)
             except Exception as e:
-                logger.debug(f"Chat poller note: {e}")
+                logger.error(f"Chat poller error: {e}")
             await asyncio.sleep(1.0)
 
     async def dispatch_chat_to_discord(self, creator: str, chat: Dict):
@@ -570,7 +571,8 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
             return
 
         try:
-            if c_type == "tip" or tip_amount > 0 or "€" in text:
+            logger.info(f"📨 [@{creator}] Relaying F2F chat from '{username}' into Discord #{target_channel.name}: '{text}'")
+            if c_type == "tip" or tip_amount > 0 or "€" in str(text):
                 msg = await target_channel.send(f"💸 **[TIP ALERT] {username}** tipped! `{text}`")
             else:
                 msg = await target_channel.send(f"💬 **[{username}]**: {text}")
@@ -583,7 +585,7 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
                 "text": text
             }
         except Exception as e:
-            logger.debug(f"Error dispatching chat to Discord channel: {e}")
+            logger.error(f"Error dispatching chat to Discord channel: {e}")
 
     @app_commands.command(name="stream", description="Open the F2F Live Stream & Video Switcher Dashboard")
     async def stream_dashboard(self, interaction: discord.Interaction, model: Optional[str] = "xsophiex"):

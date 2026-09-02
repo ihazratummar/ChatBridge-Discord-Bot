@@ -70,7 +70,7 @@ class F2FLiveSocketClient:
         except Exception as e:
             logger.debug(f"Live details fetch error for @{self.creator_handle}: {e}")
 
-        # 2. Fetch Socket Token
+        # 2. Fetch Socket Token (Prioritize creator-specific room token)
         token_endpoints = [
             f"https://f2f.com/api/creators/{self.creator_handle}/livestream/chat/token",
             f"https://f2f.com/api/socket/token/"
@@ -84,7 +84,7 @@ class F2FLiveSocketClient:
                     t = data.get("token")
                     if t:
                         token = t
-                        logger.info(f"🔑 [@{self.creator_handle}] Retrieved Live Chat JWT Socket Token!")
+                        logger.info(f"🔑 [@{self.creator_handle}] Retrieved Live Chat JWT Socket Token from {url.split('/')[-2] or url.split('/')[-1]}!")
                         break
             except Exception as e:
                 logger.debug(f"Token fetch exception for @{self.creator_handle}: {e}")
@@ -143,7 +143,8 @@ class F2FLiveSocketClient:
                     self.session = aiohttp.ClientSession()
 
                 logger.info(f"⚡ [@{self.creator_handle}] Connecting directly to F2F Live WebSocket: {self.ws_url} (Channel: '{self.active_channel_name}')...")
-                async with self.session.ws_connect(self.ws_url, headers=headers, heartbeat=20.0) as ws:
+                # Removed heartbeat=20.0 to prevent aiohttp ping conflict with Socket.IO Engine.io keepalive
+                async with self.session.ws_connect(self.ws_url, headers=headers) as ws:
                     self.ws = ws
                     
                     # 1. Wait for engine.io open packet ("0{...}")
@@ -164,6 +165,7 @@ class F2FLiveSocketClient:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             await self._handle_incoming_packet(msg.data)
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            logger.warning(f"⚠️ [@{self.creator_handle}] Socket closed or error: {msg}")
                             break
 
             except asyncio.CancelledError:
@@ -176,35 +178,61 @@ class F2FLiveSocketClient:
                 await asyncio.sleep(5)
 
     async def _handle_incoming_packet(self, data: str):
-        """Parses Engine.io / Socket.io packets from F2F Live."""
+        """Parses Engine.io / Socket.io packets from F2F Live with bulletproof regex/json index search."""
         try:
-            # Keepalive ping/pong
+            # 1. Keepalive ping/pong
             if data.startswith("2"):
                 if self.ws and not self.ws.closed:
                     await self.ws.send_str("3")
                 return
 
-            # Socket.IO Event Packet: 42["eventName", payload]
+            # 2. Socket.IO Event Packet: Starts with '42' (with optional ack ID, e.g. '42', '420', '421')
             if data.startswith("42"):
-                parsed = json.loads(data[2:])
+                json_start = data.find("[")
+                if json_start == -1:
+                    return
+
+                parsed = json.loads(data[json_start:])
+                if not isinstance(parsed, list) or len(parsed) == 0:
+                    return
+
                 event_name = parsed[0]
                 payload = parsed[1] if len(parsed) > 1 else None
 
-                # 1. Incoming Chat Message
-                if event_name == "livestream:chat:message:sent" and payload:
-                    msg_id = payload.get("id") or str(uuid.uuid4())[:8]
-                    content = payload.get("content") or payload.get("message") or ""
-                    user_obj = payload.get("user") or {}
-                    username = user_obj.get("username") or user_obj.get("display_name") or payload.get("username") or "Fan"
-                    tip_amount = payload.get("amount") or 0
-                    is_tip = tip_amount > 0 or (payload.get("type") == "tip")
+                logger.info(f"🔔 [@{self.creator_handle}] Socket Event Received: '{event_name}'")
 
-                    if "#" in msg_id:
-                        ch = msg_id.split("#")[0]
+                # Extract dictionary item whether payload is list or dict
+                item = payload if isinstance(payload, dict) else {}
+                if isinstance(payload, list):
+                    for el in payload:
+                        if isinstance(el, dict):
+                            item = el
+                            break
+
+                # Case A: Chat Message Event
+                if ("message" in event_name or "chat" in event_name) and "delete" not in event_name and item:
+                    msg_id = item.get("id") or str(uuid.uuid4())[:8]
+                    content = item.get("content") or item.get("message") or item.get("text") or ""
+                    if not content:
+                        return
+
+                    user_obj = item.get("user") or {}
+                    username = (
+                        (user_obj.get("username") if isinstance(user_obj, dict) else None) or 
+                        (user_obj.get("display_name") if isinstance(user_obj, dict) else None) or 
+                        item.get("username") or 
+                        item.get("display_name") or 
+                        "Fan"
+                    )
+                    tip_amount = item.get("amount") or item.get("tip_amount") or 0
+                    is_tip = tip_amount > 0 or (item.get("type") == "tip") or ("€" in content)
+
+                    if "#" in str(msg_id):
+                        ch = str(msg_id).split("#")[0]
                         if ch and not self.active_channel_name:
                             self.active_channel_name = ch
 
-                    msg_hash = msg_id or f"{username}:{content}"
+                    msg_hash = str(msg_id) if msg_id else f"{username}:{content}"
                     if msg_hash not in self.seen_message_ids:
                         self.seen_message_ids.add(msg_hash)
                         self.chat_seq_counter += 1
@@ -225,15 +253,15 @@ class F2FLiveSocketClient:
 
                         logger.info(f"📥 [@{self.creator_handle}] [DIRECT WS CHAT] [Seq #{self.chat_seq_counter}] {username}: {content}")
 
-                # 2. Incoming Tip Event
-                elif event_name == "livestream:chat:tip:received" and payload:
-                    tip_user = payload.get("username") or payload.get("display_name") or "Fan"
-                    tip_amt = payload.get("amount") or payload.get("total_tip_revenue") or 0
+                # Case B: Tip Received Event
+                elif "tip" in event_name and item:
+                    tip_user = item.get("username") or item.get("display_name") or "Fan"
+                    tip_amt = item.get("amount") or item.get("total_tip_revenue") or 0
                     self.chat_seq_counter += 1
                     
                     chat_item = {
                         "seq_id": self.chat_seq_counter,
-                        "id": payload.get("id") or str(uuid.uuid4())[:8],
+                        "id": item.get("id") or str(uuid.uuid4())[:8],
                         "creator": self.creator_handle,
                         "username": tip_user,
                         "text": f"€{tip_amt}",
@@ -245,7 +273,7 @@ class F2FLiveSocketClient:
                     logger.info(f"💸 [@{self.creator_handle}] [DIRECT WS TIP] {tip_user}: €{tip_amt}")
 
         except Exception as e:
-            logger.debug(f"Packet parsing error: {e}")
+            logger.error(f"⚠️ Error parsing incoming packet '{data[:100]}': {e}")
 
     async def send_chat(self, text: str) -> bool:
         """Sends a live chat message directly into the F2F Live Stream over WebSocket."""
