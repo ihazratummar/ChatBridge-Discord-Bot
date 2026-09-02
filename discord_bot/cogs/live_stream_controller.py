@@ -619,8 +619,11 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
             target_model = "aylen"
 
         # Only relay if typed in a livechat / model channel and not a bot command
+        if not target_model:
+            return
+
         is_livechat_channel = "livechat" in channel_name or "chat" in channel_name or target_model in channel_name
-        if target_model and is_livechat_channel and not message.content.startswith(("/", "!", ".")):
+        if is_livechat_channel and not message.content.startswith(("/", "!", ".")):
             res = await LiveStreamAPIService.send_live_chat(target_model, message.content)
             if res.get("success"):
                 try:
