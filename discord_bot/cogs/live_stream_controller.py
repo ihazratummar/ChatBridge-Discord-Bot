@@ -348,7 +348,11 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
         async def on_end(interaction: discord.Interaction):
             await interaction.response.defer(ephemeral=True)
             res = await LiveStreamAPIService.end_stream(self.selected_creator)
-            await interaction.followup.send(f"🛑 **Live Stream Ended for @{self.selected_creator}!**", ephemeral=True)
+            # Prune ephemeral chat memory for this creator
+            keys_to_del = [k for k, v in DISCORD_TO_F2F_CHAT_CACHE.items() if v.get("creator") == self.selected_creator]
+            for k in keys_to_del:
+                DISCORD_TO_F2F_CHAT_CACHE.pop(k, None)
+            await interaction.followup.send(f"🛑 **Live Stream Ended for @{self.selected_creator}! (Chat memory wiped)**", ephemeral=True)
             await self.refresh_dashboard(interaction)
         end_btn.callback = on_end
         actions_row.add_item(end_btn)
@@ -401,46 +405,41 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
     @classmethod
     async def send_live_chat(cls, creator: str, message: str) -> Dict:
         ep = cls.get_endpoints(creator)
+        urls = [ep['obs_agent_url']]
+        if "127.0.0.1" in ep['obs_agent_url']:
+            urls.append("http://127.0.0.1:8081" if ":8080" in ep['obs_agent_url'] else "http://127.0.0.1:8080")
         async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(
-                    f"{ep['obs_agent_url']}/api/send-chat",
-                    json={"message": message},
-                    timeout=3
-                ) as resp:
-                    return await resp.json()
-            except Exception as e:
-                return {"success": False, "error": str(e)}
+            for url in urls:
+                try:
+                    async with session.post(
+                        f"{url}/api/send-chat",
+                        json={"message": message},
+                        timeout=3
+                    ) as resp:
+                        return await resp.json()
+                except Exception:
+                    pass
+        return {"success": False, "error": "Could not connect to agent"}
 
     @classmethod
-    async def delete_live_chat(cls, creator: str, message_id: str = "", text: str = "", username: str = "") -> Dict:
+    async def get_incoming_chats(cls, creator: str, since_seq: int = 0) -> tuple:
         ep = cls.get_endpoints(creator)
+        urls = [ep['obs_agent_url']]
+        if "127.0.0.1" in ep['obs_agent_url']:
+            urls.append("http://127.0.0.1:8081" if ":8080" in ep['obs_agent_url'] else "http://127.0.0.1:8080")
         async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(
-                    f"{ep['obs_agent_url']}/api/stream/delete-chat",
-                    json={"message_id": message_id, "text": text, "username": username},
-                    timeout=3
-                ) as resp:
-                    return await resp.json()
-            except Exception as e:
-                return {"success": False, "error": str(e)}
-
-    @classmethod
-    async def get_incoming_chats(cls, creator: str, since: float = 0) -> List[Dict]:
-        ep = cls.get_endpoints(creator)
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(
-                    f"{ep['obs_agent_url']}/api/stream/incoming-chats?since={since}",
-                    timeout=3
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get("chats", [])
-            except Exception:
-                pass
-        return []
+            for url in urls:
+                try:
+                    async with session.get(
+                        f"{url}/api/stream/incoming-chats?since_seq={since_seq}",
+                        timeout=2
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            return data.get("chats", []), data.get("max_seq", since_seq)
+                except Exception:
+                    pass
+        return [], since_seq
 
 # Cache to map Discord message IDs to F2F live chat message items: { discord_msg_id: { f2f_id, creator, text, username } }
 DISCORD_TO_F2F_CHAT_CACHE = {}
@@ -451,7 +450,13 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.last_poll_timestamp = time.time()
+        self.creator_last_seq = {
+            "xsophiex": 0,
+            "chantalkuyt": 0,
+            "chantalkuytmistress": 0,
+            "zoelynn": 0,
+            "aylen": 0
+        }
         self.poller_task = None
 
     async def cog_load(self):
@@ -468,14 +473,16 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
         while not self.bot.is_closed():
             try:
                 for creator in ["xsophiex", "chantalkuyt", "chantalkuytmistress", "zoelynn", "aylen"]:
-                    chats = await LiveStreamAPIService.get_incoming_chats(creator, since=self.last_poll_timestamp)
+                    curr_seq = self.creator_last_seq.get(creator, 0)
+                    chats, max_seq = await LiveStreamAPIService.get_incoming_chats(creator, since_seq=curr_seq)
+                    if max_seq > curr_seq:
+                        self.creator_last_seq[creator] = max_seq
                     if chats:
                         for chat in chats:
                             await self.dispatch_chat_to_discord(creator, chat)
-                self.last_poll_timestamp = time.time()
             except Exception as e:
                 logger.debug(f"Chat poller note: {e}")
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
 
     async def dispatch_chat_to_discord(self, creator: str, chat: Dict):
         """Finds the correct livechat channel for the model and posts the comment with moderation hook."""
@@ -484,20 +491,35 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
         c_type = chat.get("type", "chat")
         tip_amount = chat.get("tip_amount", 0)
 
+        creator_lower = creator.lower().replace("@", "")
+        creator_key = creator_lower.replace("x", "") # e.g. "sophie" for "xsophiex"
+
         # Find model livechat channel
         target_channel = None
         for guild in self.bot.guilds:
             for channel in guild.text_channels:
-                cat_name = channel.category.name.lower() if channel.category else ""
-                ch_name = channel.name.lower()
+                cat_name = (channel.category.name.lower() if channel.category else "").replace("-", " ")
+                ch_name = channel.name.lower().replace("-", " ")
                 combined = f"{cat_name} {ch_name}"
-                if (creator in combined or ("sophie" in combined and creator == "xsophiex") or ("chantal" in combined and creator == "chantalkuyt")) and ("livechat" in ch_name or "chat" in ch_name):
+
+                is_model_match = (
+                    (creator_lower in combined) or 
+                    (creator_key in combined) or 
+                    ("sophie" in combined and "sophie" in creator_lower) or 
+                    ("chantal" in combined and "chantal" in creator_lower) or
+                    ("zoe" in combined and "zoe" in creator_lower) or
+                    ("aylen" in combined and "aylen" in creator_lower)
+                )
+                is_livechat_channel = ("livechat" in ch_name or "chat" in ch_name or "live" in ch_name)
+
+                if is_model_match and is_livechat_channel:
                     target_channel = channel
                     break
             if target_channel:
                 break
 
         if not target_channel:
+            logger.warning(f"⚠️ Could not find Discord livechat channel for creator: @{creator}")
             return
 
         try:
@@ -519,9 +541,10 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
     @app_commands.command(name="stream", description="Open the F2F Live Stream & Video Switcher Dashboard")
     async def stream_dashboard(self, interaction: discord.Interaction, model: Optional[str] = "xsophiex"):
         """Displays the interactive Components V2 Live Stream Control Dashboard."""
+        await interaction.response.defer()
         view = F2FLiveStreamDashboardView(author=interaction.user, initial_creator=model or "xsophiex")
         await view.render()
-        await interaction.response.send_message(view=view)
+        await interaction.followup.send(view=view)
 
     @app_commands.command(name="stream-video", description="Switch the active video clip playing in OBS for a model")
     @app_commands.describe(model="Creator model name (e.g. xsophiex)", video_name="Exact filename (e.g. video1.mp4)")

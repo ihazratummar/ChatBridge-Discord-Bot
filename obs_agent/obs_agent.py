@@ -327,41 +327,98 @@ class OBSAgentManager:
                 logger.debug(f"Profile lookup note: {e}")
         return "Default"
 
-    def ensure_browser_open(self):
-        """Automatically launches Google Chrome to F2F Live page with the model's dedicated profile."""
+    def get_active_display(self) -> str:
+        """Finds the active X11 display (XRDP session :10.0 or local :0)."""
+        if "DISPLAY" in os.environ and os.environ["DISPLAY"]:
+            return os.environ["DISPLAY"]
         try:
+            import glob
+            sockets = glob.glob("/tmp/.X11-unix/X*")
+            if sockets:
+                nums = [s.split("X")[-1] for s in sockets]
+                if "10" in nums:
+                    return ":10.0"
+                if "0" in nums:
+                    return ":0"
+                return f":{nums[-1]}.0"
+        except Exception:
+            pass
+        return ":10.0"
+
+    def _is_chrome_running_for_creator(self, creator: str) -> bool:
+        """Check if Chrome is already running with this creator's dedicated data directory."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["pgrep", "-a", "chrome"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.stdout:
+                for line in result.stdout.strip().split("\n"):
+                    if f"chrome-profiles/{creator}" in line or f"chrome-{creator}" in line:
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def ensure_browser_open(self):
+        """Launches Google Chrome to F2F Live page with dedicated isolated profile per model.
+        Uses --user-data-dir and --password-store=basic to guarantee 100% permanent login sessions."""
+        try:
+            creator = self.active_creator.lower()
+            if self._is_chrome_running_for_creator(creator):
+                logger.info(f"🌐 Chrome is already running for @{creator} — session preserved.")
+                return
+
             import subprocess
             import platform
             system = platform.system()
             target_url = "https://f2f.com/live/"
-            prof_dir_name = self.find_chrome_profile_directory()
+            profile_dir = os.path.expanduser(f"~/.config/chrome-profiles/{creator}")
+            os.makedirs(profile_dir, exist_ok=True)
 
-            if system == "Darwin":  # macOS
-                subprocess.Popen(["open", "-a", "Google Chrome", target_url])
-                logger.info(f"🌐 Opened Google Chrome for @{self.active_creator} on macOS")
-            elif system == "Linux":  # Linux Ubuntu VPS
+            if system == "Linux":
                 env = os.environ.copy()
-                if "DISPLAY" not in env:
-                    env["DISPLAY"] = ":0"
+                display = self.get_active_display()
+                env["DISPLAY"] = display
                 cmd = [
                     "google-chrome",
                     target_url,
-                    f"--profile-directory={prof_dir_name}",
-                    "--no-sandbox",
+                    f"--user-data-dir={profile_dir}",
+                    "--password-store=basic",
                     "--use-fake-ui-for-media-stream",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--autoplay-policy=no-user-gesture-required",
+                    "--disable-dev-shm-usage",
+                    "--enable-gpu-rasterization",
+                    "--ignore-gpu-blocklist",
+                    "--disable-background-timer-throttling",
+                    "--disable-renderer-backgrounding"
+                ]
+                subprocess.Popen(cmd, env=env)
+                logger.info(f"🌐 Launched isolated Google Chrome for @{creator} (Dir: {profile_dir}) on DISPLAY={display}")
+            elif system == "Darwin":
+                cmd = [
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    target_url,
+                    f"--user-data-dir={profile_dir}",
+                    "--password-store=basic",
                     "--no-first-run",
                     "--no-default-browser-check"
                 ]
-                subprocess.Popen(cmd, env=env)
-                logger.info(f"🌐 Opened Google Chrome for @{self.active_creator} (Profile: '{prof_dir_name}') on DISPLAY=:0")
+                subprocess.Popen(cmd)
             elif system == "Windows":
-                os.system(f'start chrome --profile-directory="{prof_dir_name}" {target_url}')
+                os.system(f'start chrome --user-data-dir="{profile_dir}" {target_url}')
         except Exception as e:
             logger.warning(f"Note on browser launch: {e}")
 
     def trigger_go_live(self, title: str = "", message: str = "", tip_goal: str = ""):
         self.ensure_browser_open()
-        self.start_virtual_cam()
+        try:
+            self.start_virtual_cam()
+        except Exception as e:
+            logger.warning(f"Virtual cam warning: {e}")
         camera_event_state["event_id"] += 1
         camera_event_state["action"] = "go_live"
         camera_event_state["title"] = title
@@ -375,8 +432,9 @@ class OBSAgentManager:
         camera_event_state["event_id"] += 1
         camera_event_state["action"] = "end_stream"
         camera_event_state["timestamp"] = time.time()
+        incoming_chat_queue.clear()
         self.stop_virtual_cam()
-        logger.info(f"🛑 Triggered 'End Stream' for @{self.active_creator}")
+        logger.info(f"🛑 Triggered 'End Stream' for @{self.active_creator} — All live chat memory cleared.")
         return {"success": True, "action": "end_stream"}
 
     def send_live_chat(self, text: str):
@@ -477,9 +535,14 @@ async def handle_delete_chat(request):
     res = agent.delete_live_chat(message_id=msg_id, text=text, username=username)
     return web.json_response(res)
 
+chat_counter = 0
+
 async def handle_incoming_chat(request):
+    global chat_counter
     body = await request.json()
+    chat_counter += 1
     chat_item = {
+        "seq_id": chat_counter,
         "id": body.get("id") or str(uuid.uuid4())[:8],
         "creator": body.get("creator") or agent.active_creator,
         "username": body.get("username", "Fan"),
@@ -491,13 +554,20 @@ async def handle_incoming_chat(request):
     incoming_chat_queue.append(chat_item)
     if len(incoming_chat_queue) > 100:
         incoming_chat_queue.pop(0)
-    logger.info(f"📥 Received live chat from F2F for @{chat_item['creator']}: [{chat_item['username']}] {chat_item['text']}")
+    logger.info(f"📥 Received live chat [Seq #{chat_counter}] for @{chat_item['creator']}: [{chat_item['username']}] {chat_item['text']}")
     return web.json_response({"status": "received", "chat": chat_item}, headers={"Access-Control-Allow-Origin": "*"})
 
 async def handle_get_incoming_chats(request):
-    since = float(request.query.get("since", 0))
-    new_chats = [c for c in incoming_chat_queue if c["timestamp"] > since]
-    return web.json_response({"chats": new_chats, "timestamp": time.time()}, headers={"Access-Control-Allow-Origin": "*"})
+    since_seq = int(request.query.get("since_seq", 0))
+    if since_seq > 0:
+        new_chats = [c for c in incoming_chat_queue if c.get("seq_id", 0) > since_seq]
+    else:
+        since = float(request.query.get("since", 0))
+        if since > 0:
+            new_chats = [c for c in incoming_chat_queue if c.get("timestamp", 0) > since]
+        else:
+            new_chats = list(incoming_chat_queue)
+    return web.json_response({"chats": new_chats, "max_seq": chat_counter, "timestamp": time.time()}, headers={"Access-Control-Allow-Origin": "*"})
 
 async def handle_set_creator(request):
     body = await request.json()
