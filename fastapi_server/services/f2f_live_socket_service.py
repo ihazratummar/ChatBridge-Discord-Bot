@@ -1,0 +1,312 @@
+"""
+Direct F2F Live Chat WebSocket Engine for FastAPI.
+Connects directly to wss://socket.f2f.net/ using creator authenticated tokens and active channel names.
+Bypasses the browser and userscript completely for zero-latency, 100% reliable Live Chat & Moderation.
+"""
+
+import asyncio
+import json
+import logging
+import time
+import uuid
+from typing import Dict, List, Optional
+import aiohttp
+from services.f2f_live_service import creator_manager
+
+logger = logging.getLogger("FastAPI-LiveSocket")
+
+class F2FLiveSocketClient:
+    """
+    Maintains a persistent, authenticated WebSocket connection to F2F Live Engine for a single model.
+    """
+    def __init__(self, creator_handle: str):
+        self.creator_handle = creator_handle.lstrip("@").lower()
+        self.ws_url = "wss://socket.f2f.net/socket.io/?EIO=4&transport=websocket"
+        self.is_connected = False
+        self.is_running = False
+        self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.listen_task: Optional[asyncio.Task] = None
+        self.ping_task: Optional[asyncio.Task] = None
+        
+        # Live Stream & Channel State
+        self.active_channel_name: str = ""
+        self.active_livestream_uuid: str = ""
+        
+        # Ephemeral Chat Queue (Sequence-based, auto-purged on stream end)
+        self.incoming_chat_queue: List[Dict] = []
+        self.chat_seq_counter: int = 0
+        self.seen_message_ids: set = set()
+
+    async def get_live_details_and_token(self) -> tuple:
+        """
+        Fetches the active livestream channel_name and official JWT Live Chat Socket Token using creator session.
+        """
+        creator_client = creator_manager.get_or_create_creator(self.creator_handle)
+        if not creator_client.is_authenticated:
+            await creator_client.login()
+
+        await creator_client._ensure_session()
+        headers = creator_client._get_headers()
+        cookies = creator_client._get_cookies()
+
+        channel_name = ""
+        token = ""
+
+        # 1. Fetch Live Stream Details (channel_name, uuid)
+        try:
+            live_resp = await creator_client.session.get(
+                f"https://f2f.com/api/creators/{self.creator_handle}/livestream/",
+                headers=headers,
+                cookies=cookies
+            )
+            if live_resp.status_code == 200:
+                live_data = live_resp.json()
+                channel_name = live_data.get("channel_name", "")
+                self.active_livestream_uuid = live_data.get("uuid", "")
+                if channel_name:
+                    self.active_channel_name = channel_name
+                    logger.info(f"📺 [@{self.creator_handle}] Discovered Live Channel: '{channel_name}' (UUID: {self.active_livestream_uuid})")
+        except Exception as e:
+            logger.debug(f"Live details fetch error for @{self.creator_handle}: {e}")
+
+        # 2. Fetch Socket Token
+        token_endpoints = [
+            f"https://f2f.com/api/creators/{self.creator_handle}/livestream/chat/token",
+            f"https://f2f.com/api/socket/token/"
+        ]
+
+        for url in token_endpoints:
+            try:
+                resp = await creator_client.session.get(url, headers=headers, cookies=cookies)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    t = data.get("token")
+                    if t:
+                        token = t
+                        logger.info(f"🔑 [@{self.creator_handle}] Retrieved Live Chat JWT Socket Token!")
+                        break
+            except Exception as e:
+                logger.debug(f"Token fetch exception for @{self.creator_handle}: {e}")
+
+        return channel_name, token
+
+    async def start(self):
+        """Starts the persistent background connection to F2F Live WebSocket."""
+        if self.is_running:
+            return
+        self.is_running = True
+        self.listen_task = asyncio.create_task(self._socket_lifecycle_loop())
+
+    async def stop(self):
+        """Stops the socket connection and cleanly purges ephemeral memory."""
+        self.is_running = False
+        self.is_connected = False
+        if self.listen_task and not self.listen_task.done():
+            self.listen_task.cancel()
+        if self.ping_task and not self.ping_task.done():
+            self.ping_task.cancel()
+        if self.ws and not self.ws.closed:
+            await self.ws.close()
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+        # Ephemeral memory purge
+        self.incoming_chat_queue.clear()
+        self.seen_message_ids.clear()
+        logger.info(f"🛑 [@{self.creator_handle}] Disconnected from F2F WebSocket & Ephemeral Live Chat Memory Purged.")
+
+    async def _socket_lifecycle_loop(self):
+        """Autonomous auto-reconnect lifecycle loop for F2F Live WebSocket."""
+        while self.is_running:
+            try:
+                creator_client = creator_manager.get_or_create_creator(self.creator_handle)
+                if not creator_client.password:
+                    logger.debug(f"ℹ️ [@{self.creator_handle}] Live socket idle: No credentials configured in .env.")
+                    await asyncio.sleep(60)
+                    continue
+
+                channel_name, token = await self.get_live_details_and_token()
+                if not token:
+                    logger.info(f"ℹ️ [@{self.creator_handle}] Waiting for creator to be live on F2F to connect Live Chat...")
+                    await asyncio.sleep(15)
+                    continue
+
+                cookie_str = "; ".join([f"{k}={v}" for k, v in creator_client._get_cookies().items()])
+                headers = {
+                    "Origin": "https://f2f.com",
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Cookie": cookie_str
+                }
+
+                if not self.session or self.session.closed:
+                    self.session = aiohttp.ClientSession()
+
+                logger.info(f"⚡ [@{self.creator_handle}] Connecting directly to F2F Live WebSocket: {self.ws_url} (Channel: '{self.active_channel_name}')...")
+                async with self.session.ws_connect(self.ws_url, headers=headers, heartbeat=20.0) as ws:
+                    self.ws = ws
+                    
+                    # 1. Wait for engine.io open packet ("0{...}")
+                    handshake_msg = await ws.receive_str()
+                    logger.info(f"🤝 [@{self.creator_handle}] Engine.io handshake received: {handshake_msg[:60]}...")
+                    
+                    # 2. Send Socket.IO v4 auth connect packet ("40{"token":"..."}")
+                    connect_packet = "40" + json.dumps({"token": token})
+                    await ws.send_str(connect_packet)
+                    
+                    # 3. Receive auth confirmation
+                    auth_confirm = await ws.receive_str()
+                    logger.info(f"🎉 [@{self.creator_handle}] Live Chat WebSocket AUTHENTICATED! Response: {auth_confirm}")
+                    self.is_connected = True
+
+                    # 4. Process incoming socket frames
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            await self._handle_incoming_packet(msg.data)
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"⚠️ [@{self.creator_handle}] F2F WebSocket connection error: {e}. Reconnecting in 5s...")
+            
+            self.is_connected = False
+            if self.is_running:
+                await asyncio.sleep(5)
+
+    async def _handle_incoming_packet(self, data: str):
+        """Parses Engine.io / Socket.io packets from F2F Live."""
+        try:
+            # Keepalive ping/pong
+            if data.startswith("2"):
+                if self.ws and not self.ws.closed:
+                    await self.ws.send_str("3")
+                return
+
+            # Socket.IO Event Packet: 42["eventName", payload]
+            if data.startswith("42"):
+                parsed = json.loads(data[2:])
+                event_name = parsed[0]
+                payload = parsed[1] if len(parsed) > 1 else None
+
+                # 1. Incoming Chat Message
+                if event_name == "livestream:chat:message:sent" and payload:
+                    msg_id = payload.get("id") or str(uuid.uuid4())[:8]
+                    content = payload.get("content") or payload.get("message") or ""
+                    user_obj = payload.get("user") or {}
+                    username = user_obj.get("username") or user_obj.get("display_name") or payload.get("username") or "Fan"
+                    tip_amount = payload.get("amount") or 0
+                    is_tip = tip_amount > 0 or (payload.get("type") == "tip")
+
+                    if "#" in msg_id:
+                        ch = msg_id.split("#")[0]
+                        if ch and not self.active_channel_name:
+                            self.active_channel_name = ch
+
+                    msg_hash = msg_id or f"{username}:{content}"
+                    if msg_hash not in self.seen_message_ids:
+                        self.seen_message_ids.add(msg_hash)
+                        self.chat_seq_counter += 1
+                        
+                        chat_item = {
+                            "seq_id": self.chat_seq_counter,
+                            "id": msg_id,
+                            "creator": self.creator_handle,
+                            "username": username,
+                            "text": content,
+                            "type": "tip" if is_tip else "chat",
+                            "tip_amount": tip_amount,
+                            "timestamp": time.time()
+                        }
+                        self.incoming_chat_queue.append(chat_item)
+                        if len(self.incoming_chat_queue) > 100:
+                            self.incoming_chat_queue.pop(0)
+
+                        logger.info(f"📥 [@{self.creator_handle}] [DIRECT WS CHAT] [Seq #{self.chat_seq_counter}] {username}: {content}")
+
+                # 2. Incoming Tip Event
+                elif event_name == "livestream:chat:tip:received" and payload:
+                    tip_user = payload.get("username") or payload.get("display_name") or "Fan"
+                    tip_amt = payload.get("amount") or payload.get("total_tip_revenue") or 0
+                    self.chat_seq_counter += 1
+                    
+                    chat_item = {
+                        "seq_id": self.chat_seq_counter,
+                        "id": payload.get("id") or str(uuid.uuid4())[:8],
+                        "creator": self.creator_handle,
+                        "username": tip_user,
+                        "text": f"€{tip_amt}",
+                        "type": "tip",
+                        "tip_amount": tip_amt,
+                        "timestamp": time.time()
+                    }
+                    self.incoming_chat_queue.append(chat_item)
+                    logger.info(f"💸 [@{self.creator_handle}] [DIRECT WS TIP] {tip_user}: €{tip_amt}")
+
+        except Exception as e:
+            logger.debug(f"Packet parsing error: {e}")
+
+    async def send_chat(self, text: str) -> bool:
+        """Sends a live chat message directly into the F2F Live Stream over WebSocket."""
+        if not self.ws or self.ws.closed or not self.is_connected:
+            logger.warning(f"⚠️ [@{self.creator_handle}] Cannot send chat: WebSocket is not connected.")
+            return False
+
+        channel = self.active_channel_name or self.creator_handle
+        payload = ["livestream:chat:message:send", [channel, text]]
+        packet = "42" + json.dumps(payload)
+        
+        try:
+            await self.ws.send_str(packet)
+            logger.info(f"💬 [@{self.creator_handle}] [DIRECT WS DISPATCH] Sent live chat: '{text}' to channel '{channel}'")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error sending live chat over WebSocket: {e}")
+            return False
+
+    async def delete_chat(self, message_id: str) -> bool:
+        """Deletes a message from the F2F Live Stream directly over WebSocket."""
+        if not self.ws or self.ws.closed or not self.is_connected:
+            logger.warning(f"⚠️ [@{self.creator_handle}] Cannot delete chat: WebSocket is not connected.")
+            return False
+
+        channel = self.active_channel_name or self.creator_handle
+        payload = ["livestream:chat:message:delete", [channel, str(message_id)]]
+        packet = "42" + json.dumps(payload)
+
+        try:
+            await self.ws.send_str(packet)
+            logger.info(f"🗑️ [@{self.creator_handle}] [DIRECT WS DELETE] Dispatched delete for message ID: {message_id}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error deleting live chat over WebSocket: {e}")
+            return False
+
+    def get_incoming_chats(self, since_seq: int = 0) -> List[Dict]:
+        """Returns new live chats since sequence ID."""
+        if since_seq > 0:
+            return [c for c in self.incoming_chat_queue if c.get("seq_id", 0) > since_seq]
+        return list(self.incoming_chat_queue)
+
+
+class F2FLiveChatManager:
+    """Manages Live WebSocket instances across all creator models."""
+    def __init__(self):
+        self.clients: Dict[str, F2FLiveSocketClient] = {}
+
+    def get_client(self, creator_handle: str) -> F2FLiveSocketClient:
+        clean = creator_handle.lstrip("@").lower()
+        if clean not in self.clients:
+            self.clients[clean] = F2FLiveSocketClient(clean)
+        return self.clients[clean]
+
+    async def start_all(self):
+        """Starts socket listeners only for configured active models."""
+        for handle in ["xsophiex", "chantalkuyt", "aylen", "zoelynn"]:
+            creator_client = creator_manager.get_or_create_creator(handle)
+            if creator_client.password:
+                client = self.get_client(handle)
+                await client.start()
+
+live_chat_manager = F2FLiveChatManager()

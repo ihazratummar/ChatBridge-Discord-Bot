@@ -405,40 +405,87 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
     @classmethod
     async def send_live_chat(cls, creator: str, message: str) -> Dict:
         ep = cls.get_endpoints(creator)
-        urls = [ep['obs_agent_url']]
-        if "127.0.0.1" in ep['obs_agent_url']:
-            urls.append("http://127.0.0.1:8081" if ":8080" in ep['obs_agent_url'] else "http://127.0.0.1:8080")
+        fastapi_url = ep.get('fastapi_url', 'http://127.0.0.1:8000')
         async with aiohttp.ClientSession() as session:
-            for url in urls:
-                try:
-                    async with session.post(
-                        f"{url}/api/send-chat",
-                        json={"message": message},
-                        timeout=3
-                    ) as resp:
+            # 1. Direct FastAPI Server-to-Server Live Socket
+            try:
+                async with session.post(
+                    f"{fastapi_url}/api/live/chat/send",
+                    json={"creator": creator, "message": message},
+                    timeout=3
+                ) as resp:
+                    if resp.status == 200:
                         return await resp.json()
-                except Exception:
-                    pass
-        return {"success": False, "error": "Could not connect to agent"}
+            except Exception:
+                pass
+
+            # 2. Fallback to VPS OBS Agent
+            try:
+                async with session.post(
+                    f"{ep['obs_agent_url']}/api/send-chat",
+                    json={"message": message},
+                    timeout=3
+                ) as resp:
+                    return await resp.json()
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
+    @classmethod
+    async def delete_live_chat(cls, creator: str, message_id: str = "", text: str = "", username: str = "") -> Dict:
+        ep = cls.get_endpoints(creator)
+        fastapi_url = ep.get('fastapi_url', 'http://127.0.0.1:8000')
+        async with aiohttp.ClientSession() as session:
+            # 1. Direct FastAPI Server-to-Server Live Socket
+            try:
+                async with session.post(
+                    f"{fastapi_url}/api/live/chat/delete",
+                    json={"creator": creator, "message_id": message_id},
+                    timeout=3
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+            except Exception:
+                pass
+
+            # 2. Fallback to VPS OBS Agent
+            try:
+                async with session.post(
+                    f"{ep['obs_agent_url']}/api/stream/delete-chat",
+                    json={"message_id": message_id, "text": text, "username": username},
+                    timeout=3
+                ) as resp:
+                    return await resp.json()
+            except Exception as e:
+                return {"success": False, "error": str(e)}
 
     @classmethod
     async def get_incoming_chats(cls, creator: str, since_seq: int = 0) -> tuple:
         ep = cls.get_endpoints(creator)
-        urls = [ep['obs_agent_url']]
-        if "127.0.0.1" in ep['obs_agent_url']:
-            urls.append("http://127.0.0.1:8081" if ":8080" in ep['obs_agent_url'] else "http://127.0.0.1:8080")
+        fastapi_url = ep.get('fastapi_url', 'http://127.0.0.1:8000')
         async with aiohttp.ClientSession() as session:
-            for url in urls:
-                try:
-                    async with session.get(
-                        f"{url}/api/stream/incoming-chats?since_seq={since_seq}",
-                        timeout=2
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            return data.get("chats", []), data.get("max_seq", since_seq)
-                except Exception:
-                    pass
+            # 1. Direct FastAPI Server-to-Server Live Socket
+            try:
+                async with session.get(
+                    f"{fastapi_url}/api/live/chat/incoming?creator={creator}&since_seq={since_seq}",
+                    timeout=2
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("chats", []), data.get("max_seq", since_seq)
+            except Exception:
+                pass
+
+            # 2. Fallback to VPS OBS Agent
+            try:
+                async with session.get(
+                    f"{ep['obs_agent_url']}/api/stream/incoming-chats?since_seq={since_seq}",
+                    timeout=2
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("chats", []), data.get("max_seq", since_seq)
+            except Exception:
+                pass
         return [], since_seq
 
 # Cache to map Discord message IDs to F2F live chat message items: { discord_msg_id: { f2f_id, creator, text, username } }

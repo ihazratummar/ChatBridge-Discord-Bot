@@ -127,6 +127,75 @@ async def receive_obs_event(request: Request):
 
     return {"status": "received", "data": data}
 
+from services.f2f_live_socket_service import live_chat_manager
+
+# ─── Direct Live Chat Endpoints (Zero-Latency Server-to-Server) ──
+@app.get("/api/live/chat/incoming")
+async def get_incoming_live_chats(creator: str = "xsophiex", since_seq: int = 0):
+    """
+    Returns new incoming live chat messages and tips for a creator model directly from F2F WebSocket.
+    """
+    client = live_chat_manager.get_client(creator)
+    if not client.is_running:
+        await client.start()
+    chats = client.get_incoming_chats(since_seq=since_seq)
+    return {
+        "creator": creator,
+        "chats": chats,
+        "max_seq": client.chat_seq_counter,
+        "is_connected": client.is_connected
+    }
+
+@app.post("/api/live/chat/send")
+async def send_live_chat_message(request: Request):
+    """
+    Dispatches a chat message to F2F Live stream directly over WebSocket.
+    """
+    data = await request.json()
+    creator = data.get("creator", "xsophiex")
+    text = data.get("message") or data.get("text", "")
+    if not text:
+        return {"success": False, "error": "No message text provided"}
+
+    client = live_chat_manager.get_client(creator)
+    if not client.is_running:
+        await client.start()
+        await asyncio.sleep(1)
+
+    success = await client.send_chat(text)
+    return {"success": success, "creator": creator, "text": text}
+
+@app.post("/api/live/chat/delete")
+async def delete_live_chat_message(request: Request):
+    """
+    Deletes a message from F2F Live stream directly over WebSocket.
+    """
+    data = await request.json()
+    creator = data.get("creator", "xsophiex")
+    message_id = data.get("message_id") or data.get("id", "")
+    if not message_id:
+        return {"success": False, "error": "No message_id provided"}
+
+    client = live_chat_manager.get_client(creator)
+    success = await client.delete_chat(message_id)
+    return {"success": success, "creator": creator, "message_id": message_id}
+
+@app.post("/api/live/chat/connect")
+async def connect_live_chat_socket(request: Request):
+    data = await request.json()
+    creator = data.get("creator", "xsophiex")
+    client = live_chat_manager.get_client(creator)
+    await client.start()
+    return {"status": "started", "creator": creator}
+
+@app.post("/api/live/chat/disconnect")
+async def disconnect_live_chat_socket(request: Request):
+    data = await request.json()
+    creator = data.get("creator", "xsophiex")
+    client = live_chat_manager.get_client(creator)
+    await client.stop()
+    return {"status": "stopped", "creator": creator}
+
 @app.get("/dock", response_class=HTMLResponse)
 async def serve_dock():
     """
@@ -144,6 +213,8 @@ async def startup_event():
     creator = live_status.get("active_creator", "xsophiex")
     client = creator_manager.get_or_create_creator(creator)
     asyncio.create_task(client.start_fyp_loop(global_sec=15, followers_sec=5))
+    logger.info("⚡ Starting Direct F2F Live Chat WebSocket Engine...")
+    asyncio.create_task(live_chat_manager.start_all())
 
 if __name__ == "__main__":
     logger.info("🚀 Starting FastAPI Server on http://0.0.0.0:8000 ...")
