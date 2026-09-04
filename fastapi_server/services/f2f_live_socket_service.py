@@ -213,16 +213,25 @@ class F2FLiveSocketClient:
                 await asyncio.sleep(5)
 
     async def _stream_monitor_loop(self, ws):
-        """Continuously checks if creator goes live or switches channel while socket is connected."""
+        """Continuously checks if creator switches channel or starts a new stream while socket is connected."""
         while not ws.closed and self.is_connected:
             try:
-                await asyncio.sleep(10)
-                channel_name, token = await self.get_live_details_and_token()
-                if channel_name and channel_name != self.active_channel_name and self.chat_token:
-                    self.active_channel_name = channel_name
-                    join_packet = "42" + json.dumps(["livestream:chat:user:join", self.active_channel_name, self.chat_token])
-                    await ws.send_str(join_packet)
-                    logger.info(f"🚪 [@{self.creator_handle}] Auto-joined newly started stream: '{self.active_channel_name}'!")
+                await asyncio.sleep(15)
+                creator_client = creator_manager.get_or_create_creator(self.creator_handle)
+                headers = creator_client._get_headers()
+                cookies = creator_client._get_cookies()
+                live_resp = await creator_client.session.get(
+                    f"https://f2f.com/api/creators/{self.creator_handle}/livestream/",
+                    headers=headers,
+                    cookies=cookies
+                )
+                if live_resp.status_code == 200:
+                    live_data = live_resp.json()
+                    new_channel = live_data.get("channel_name", "")
+                    if new_channel and self.active_channel_name and new_channel != self.active_channel_name:
+                        logger.info(f"🔄 [@{self.creator_handle}] Livestream channel changed from '{self.active_channel_name}' to '{new_channel}'. Cycling socket to re-authenticate and auto-join!")
+                        await ws.close()
+                        break
             except Exception as e:
                 logger.debug(f"Stream monitor tick error: {e}")
 

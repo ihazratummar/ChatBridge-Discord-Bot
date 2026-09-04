@@ -531,8 +531,13 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
                         continue
 
                     chats, max_seq = await LiveStreamAPIService.get_incoming_chats(creator, since_seq=curr_seq)
-                    if max_seq > curr_seq:
+                    if max_seq < curr_seq:
+                        # Server restarted or counter reset: auto-resync to current server head immediately!
+                        logger.info(f"🔄 Live chat sequence reset for @{creator} ({curr_seq} -> {max_seq}). Auto-resynced.")
                         self.creator_last_seq[creator] = max_seq
+                    elif max_seq > curr_seq:
+                        self.creator_last_seq[creator] = max_seq
+
                     if chats:
                         for chat in chats:
                             await self.dispatch_chat_to_discord(creator, chat)
