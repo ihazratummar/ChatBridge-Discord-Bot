@@ -45,6 +45,11 @@
       <span id="media-source" class="badge badge-warning">Media: Loading...</span>
     </div>
 
+    <div style="margin-bottom: 8px;">
+      <label>🎬 Selected Video Clip</label>
+      <div id="active-video-name" style="font-weight: 600; color: #f5e0dc; word-break: break-all; font-size: 12px;">--</div>
+    </div>
+
     <div class="telemetry">
       <div class="metric">
         <div class="metric-label">Time Remaining</div>
@@ -54,6 +59,11 @@
         <div class="metric-label">Playback State</div>
         <div id="media-state" class="metric-value" style="font-size: 13px;">--</div>
       </div>
+    </div>
+
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px;">
+      <button id="btn-flip-h" onclick="flipTransform('horizontal')" style="padding: 8px; background-color: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 6px; cursor: pointer; font-weight: 600; transition: 0.2s;">↔️ Flip H</button>
+      <button id="btn-flip-v" onclick="flipTransform('vertical')" style="padding: 8px; background-color: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 6px; cursor: pointer; font-weight: 600; transition: 0.2s;">↕️ Flip V</button>
     </div>
   </div>
 
@@ -83,6 +93,19 @@
       }
     }
 
+    async function flipTransform(direction) {
+      try {
+        await fetch(`/api/flip-${direction}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
+        await updateStatus();
+      } catch (e) {
+        console.error("Flip error:", e);
+      }
+    }
+
     async function updateStatus() {
       try {
         const res = await fetch('/api/status');
@@ -90,8 +113,11 @@
 
         const conn = document.getElementById('conn-status');
         const mediaSource = document.getElementById('media-source');
+        const activeVideoName = document.getElementById('active-video-name');
         const timeLeft = document.getElementById('time-left');
         const mediaState = document.getElementById('media-state');
+        const btnFlipH = document.getElementById('btn-flip-h');
+        const btnFlipV = document.getElementById('btn-flip-v');
 
         if (data.is_connected) {
           conn.className = 'badge badge-success';
@@ -103,6 +129,9 @@
 
         if (data.input_name) {
           mediaSource.innerText = data.input_name;
+          if (activeVideoName) {
+            activeVideoName.innerText = data.active_video || data.input_name;
+          }
           const remSec = Math.max(0, Math.floor(data.remaining_sec || 0));
           const mins = Math.floor(remSec / 60).toString().padStart(2, '0');
           const secs = (remSec % 60).toString().padStart(2, '0');
@@ -110,9 +139,37 @@
           mediaState.innerText = data.state || 'PLAYING';
         } else {
           mediaSource.innerText = 'No Media Source';
+          if (activeVideoName) {
+            activeVideoName.innerText = '--';
+          }
           timeLeft.innerText = '--:--';
           mediaState.innerText = 'STOPPED';
         }
+
+        if (btnFlipH) {
+          if (data.flipped_h) {
+            btnFlipH.style.backgroundColor = '#89b4fa';
+            btnFlipH.style.color = '#11111b';
+            btnFlipH.innerText = '↔️ Flipped H';
+          } else {
+            btnFlipH.style.backgroundColor = '#313244';
+            btnFlipH.style.color = '#cdd6f4';
+            btnFlipH.innerText = '↔️ Flip H';
+          }
+        }
+
+        if (btnFlipV) {
+          if (data.flipped_v) {
+            btnFlipV.style.backgroundColor = '#89b4fa';
+            btnFlipV.style.color = '#11111b';
+            btnFlipV.innerText = '↕️ Flipped V';
+          } else {
+            btnFlipV.style.backgroundColor = '#313244';
+            btnFlipV.style.color = '#cdd6f4';
+            btnFlipV.innerText = '↕️ Flip V';
+          }
+        }
+
       } catch (e) {
         document.getElementById('conn-status').className = 'badge badge-danger';
         document.getElementById('conn-status').innerText = 'Agent Offline';

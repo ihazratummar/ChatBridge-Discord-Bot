@@ -56,14 +56,17 @@ async def get_status():
 @app.post("/api/obs-telemetry")
 async def receive_obs_telemetry(request: Request):
     """
-    Receives real-time video playback countdown from OBS Studio
+    Receives real-time video playback countdown and transform status from OBS Studio
     """
     data = await request.json()
     live_status["active_creator"] = data.get("creator", live_status.get("active_creator", "xsophiex"))
     live_status["input_name"] = data.get("media_name", "")
+    live_status["active_video"] = data.get("active_video", data.get("media_name", ""))
     live_status["duration_sec"] = data.get("duration_sec", 0.0)
     live_status["remaining_sec"] = data.get("remaining_sec", 0.0)
     live_status["state"] = data.get("state", "PLAYING")
+    live_status["flipped_h"] = data.get("flipped_h", False)
+    live_status["flipped_v"] = data.get("flipped_v", False)
     live_status["is_connected"] = True
     return {"status": "ok"}
 

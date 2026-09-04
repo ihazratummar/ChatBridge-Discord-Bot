@@ -87,6 +87,9 @@ class OBSAgentManager:
         self.obs_client = None
         self.is_connected = False
         self.current_media_input = None
+        self.current_video_file = None
+        self._cached_transform = {"flipped_h": False, "flipped_v": False}
+        self._last_transform_check = 0
         self.last_triggered_time = 0
         self.active_creator = self.config.get("selected_creator", "xsophiex")
 
@@ -106,6 +109,204 @@ class OBSAgentManager:
             self.is_connected = False
             self.obs_client = None
             return False
+
+    def get_active_video_name(self, input_name: str = None) -> str:
+        """Retrieves the exact filename of the video currently loaded in OBS Media source."""
+        if getattr(self, "current_video_file", None):
+            return self.current_video_file
+        target = input_name or self.current_media_input or "Media"
+        if self.is_connected and self.obs_client:
+            try:
+                res = self.obs_client.get_input_settings(target)
+                settings = getattr(res, "input_settings", {})
+                if isinstance(settings, dict):
+                    local_file = settings.get("local_file", "")
+                    if local_file:
+                        file_name = os.path.basename(local_file)
+                        self.current_video_file = file_name
+                        return file_name
+                    playlist = settings.get("playlist", [])
+                    if isinstance(playlist, list) and playlist:
+                        first_item = playlist[0]
+                        if isinstance(first_item, dict) and first_item.get("value"):
+                            file_name = os.path.basename(first_item["value"])
+                            self.current_video_file = file_name
+                            return file_name
+            except Exception:
+                pass
+        return target
+
+    def find_scene_item(self, source_name: str = None):
+        """Finds (scene_name, item_id) for the target source across program scene or scene list."""
+        if not self.is_connected or not self.obs_client:
+            self.connect_obs()
+            if not self.is_connected:
+                return None, None
+
+        target = source_name or self.current_media_input or self.find_active_media_input() or "Media"
+
+        # 1. Try active program scene first
+        try:
+            cur = self.obs_client.get_current_program_scene()
+            scene_name = getattr(cur, "current_program_scene_name", None) or getattr(cur, "scene_name", None)
+            if scene_name:
+                try:
+                    item_res = self.obs_client.get_scene_item_id(scene_name, target)
+                    item_id = getattr(item_res, "scene_item_id", None)
+                    if item_id is not None:
+                        return scene_name, item_id
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 2. Search through all available scenes
+        try:
+            scene_list = self.obs_client.get_scene_list()
+            scenes = getattr(scene_list, "scenes", [])
+            for sc in scenes:
+                s_name = sc.get("sceneName") if isinstance(sc, dict) else getattr(sc, "scene_name", None)
+                if not s_name:
+                    continue
+                try:
+                    item_res = self.obs_client.get_scene_item_id(s_name, target)
+                    item_id = getattr(item_res, "scene_item_id", None)
+                    if item_id is not None:
+                        return s_name, item_id
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug(f"Scene item search note: {e}")
+
+        return None, None
+
+    def get_transform_status(self, source_name: str = None) -> dict:
+        """Returns the current orientation and scale of the target source."""
+        if not self.is_connected or not self.obs_client:
+            self.connect_obs()
+            if not self.is_connected:
+                return {"flipped_h": False, "flipped_v": False, "connected": False}
+
+        scene_name, item_id = self.find_scene_item(source_name)
+        if not scene_name or item_id is None:
+            return {"flipped_h": False, "flipped_v": False, "error": "Scene item not found"}
+
+        try:
+            res = self.obs_client.get_scene_item_transform(scene_name, item_id)
+            transform = getattr(res, "scene_item_transform", {})
+            if isinstance(transform, dict):
+                scale_x = float(transform.get("scaleX", 1.0))
+                scale_y = float(transform.get("scaleY", 1.0))
+            else:
+                scale_x = float(getattr(transform, "scale_x", 1.0))
+                scale_y = float(getattr(transform, "scale_y", 1.0))
+
+            status = {
+                "flipped_h": scale_x < 0,
+                "flipped_v": scale_y < 0,
+                "scale_x": scale_x,
+                "scale_y": scale_y,
+                "scene_name": scene_name,
+                "item_id": item_id
+            }
+            self._cached_transform = status
+            return status
+        except Exception as e:
+            logger.debug(f"Error getting transform: {e}")
+            return {"flipped_h": False, "flipped_v": False, "error": str(e)}
+
+    def flip_source(self, direction: str = "horizontal", source_name: str = None) -> dict:
+        """Toggles horizontal or vertical flip on the target OBS source."""
+        if not self.is_connected or not self.obs_client:
+            self.connect_obs()
+            if not self.is_connected:
+                return {"success": False, "error": "Not connected to OBS"}
+
+        target = source_name or self.current_media_input or self.find_active_media_input() or "Media"
+        scene_name, item_id = self.find_scene_item(target)
+        if not scene_name or item_id is None:
+            return {"success": False, "error": f"Source '{target}' not found in any OBS scene"}
+
+        try:
+            res = self.obs_client.get_scene_item_transform(scene_name, item_id)
+            transform = getattr(res, "scene_item_transform", {})
+            if not isinstance(transform, dict):
+                transform = {
+                    "scaleX": getattr(transform, "scale_x", 1.0),
+                    "scaleY": getattr(transform, "scale_y", 1.0),
+                    "positionX": getattr(transform, "position_x", 0.0),
+                    "positionY": getattr(transform, "position_y", 0.0),
+                    "alignment": getattr(transform, "alignment", 5),
+                    "boundsType": getattr(transform, "bounds_type", "OBS_BOUNDS_NONE"),
+                    "width": getattr(transform, "width", 0.0),
+                    "height": getattr(transform, "height", 0.0),
+                    "sourceWidth": getattr(transform, "source_width", 1920),
+                    "sourceHeight": getattr(transform, "source_height", 1080),
+                }
+
+            cur_scale_x = float(transform.get("scaleX", 1.0))
+            cur_scale_y = float(transform.get("scaleY", 1.0))
+            cur_pos_x = float(transform.get("positionX", 0.0))
+            cur_pos_y = float(transform.get("positionY", 0.0))
+            alignment = int(transform.get("alignment", 5))
+            bounds_type = str(transform.get("boundsType", "OBS_BOUNDS_NONE"))
+
+            width = float(transform.get("width", 0.0))
+            if width <= 0:
+                width = float(transform.get("sourceWidth", 1920)) * abs(cur_scale_x)
+
+            height = float(transform.get("height", 0.0))
+            if height <= 0:
+                height = float(transform.get("sourceHeight", 1080)) * abs(cur_scale_y)
+
+            update_payload = {}
+            dir_lower = direction.lower()
+
+            if "horiz" in dir_lower or dir_lower == "h":
+                new_scale_x = -cur_scale_x
+                update_payload["scaleX"] = new_scale_x
+                if bounds_type == "OBS_BOUNDS_NONE":
+                    if alignment & 1:  # Left-aligned anchor
+                        delta_x = width if new_scale_x < 0 else -width
+                        update_payload["positionX"] = cur_pos_x + delta_x
+                    elif alignment & 2:  # Right-aligned anchor
+                        delta_x = -width if new_scale_x < 0 else width
+                        update_payload["positionX"] = cur_pos_x + delta_x
+
+            elif "vert" in dir_lower or dir_lower == "v":
+                new_scale_y = -cur_scale_y
+                update_payload["scaleY"] = new_scale_y
+                if bounds_type == "OBS_BOUNDS_NONE":
+                    if alignment & 4:  # Top-aligned anchor
+                        delta_y = height if new_scale_y < 0 else -height
+                        update_payload["positionY"] = cur_pos_y + delta_y
+                    elif alignment & 8:  # Bottom-aligned anchor
+                        delta_y = -height if new_scale_y < 0 else height
+                        update_payload["positionY"] = cur_pos_y + delta_y
+            else:
+                return {"success": False, "error": f"Invalid flip direction: '{direction}'. Use 'horizontal' or 'vertical'"}
+
+            self.obs_client.set_scene_item_transform(scene_name, item_id, update_payload)
+
+            resulting_scale_x = update_payload.get("scaleX", cur_scale_x)
+            resulting_scale_y = update_payload.get("scaleY", cur_scale_y)
+            status = {
+                "success": True,
+                "direction": "horizontal" if "horiz" in dir_lower or dir_lower == "h" else "vertical",
+                "flipped_h": resulting_scale_x < 0,
+                "flipped_v": resulting_scale_y < 0,
+                "scale_x": resulting_scale_x,
+                "scale_y": resulting_scale_y,
+                "source_name": target,
+                "scene_name": scene_name
+            }
+            self._cached_transform = status
+            logger.info(f"🔄 Flipped OBS Source '{target}' ({status['direction']}) in scene '{scene_name}' (Flipped H: {status['flipped_h']}, Flipped V: {status['flipped_v']})")
+            return status
+
+        except Exception as e:
+            logger.error(f"Failed to flip source transform: {e}")
+            return {"success": False, "error": str(e)}
 
     def find_active_media_input(self):
         if not self.is_connected or not self.obs_client:
@@ -145,22 +346,35 @@ class OBSAgentManager:
             cursor_ms = status.media_cursor if status.media_cursor is not None else 0
             state = status.media_state
 
+            # Periodically refresh transform status every 3 seconds
+            now = time.time()
+            if (now - getattr(self, "_last_transform_check", 0)) > 3.0:
+                self._last_transform_check = now
+                self.get_transform_status()
+
+            active_video = self.get_active_video_name(self.current_media_input)
+            cached_tr = getattr(self, "_cached_transform", {})
+            flipped_h = cached_tr.get("flipped_h", False)
+            flipped_v = cached_tr.get("flipped_v", False)
+
             if duration_ms <= 0:
                 return {
                     "input_name": self.current_media_input,
+                    "active_video": active_video,
                     "duration_sec": 0.0,
                     "cursor_sec": 0.0,
                     "remaining_sec": 0.0,
                     "state": state,
                     "active_creator": self.active_creator,
-                    "is_connected": True
+                    "is_connected": True,
+                    "flipped_h": flipped_h,
+                    "flipped_v": flipped_v
                 }
 
             remaining_sec = max(0.0, (duration_ms - cursor_ms) / 1000.0)
 
             # Detect 5-second remaining boundary
             trigger_sec = self.config.get("pause_trigger_seconds", 5.0)
-            now = time.time()
             if 0 < remaining_sec <= trigger_sec and (now - self.last_triggered_time) > (trigger_sec + 3):
                 self.last_triggered_time = now
                 self.trigger_video_end_event(remaining_sec)
@@ -171,21 +385,27 @@ class OBSAgentManager:
                 requests.post(f"{vps_url}/api/obs-telemetry", json={
                     "creator": self.active_creator,
                     "media_name": self.current_media_input,
+                    "active_video": active_video,
                     "duration_sec": duration_ms / 1000.0,
                     "remaining_sec": remaining_sec,
-                    "state": "PLAYING" if state == "OBS_MEDIA_STATE_PLAYING" or state == 1 else str(state)
+                    "state": "PLAYING" if state == "OBS_MEDIA_STATE_PLAYING" or state == 1 else str(state),
+                    "flipped_h": flipped_h,
+                    "flipped_v": flipped_v
                 }, timeout=0.5)
             except Exception:
                 pass
 
             return {
                 "input_name": self.current_media_input,
+                "active_video": active_video,
                 "duration_sec": duration_ms / 1000.0,
                 "cursor_sec": cursor_ms / 1000.0,
                 "remaining_sec": remaining_sec,
                 "state": state,
                 "active_creator": self.active_creator,
-                "is_connected": True
+                "is_connected": True,
+                "flipped_h": flipped_h,
+                "flipped_v": flipped_v
             }
         except Exception as e:
             logger.error(f"Error polling media status: {e}")
@@ -298,6 +518,7 @@ class OBSAgentManager:
                 overlay=True
             )
             self.last_triggered_time = time.time()
+            self.current_video_file = video_name
             logger.info(f"🎬 Successfully switched OBS Media source '{input_name}' to: {video_name} ({video_path})")
             return {"success": True, "active_video": video_name, "input_name": input_name}
         except Exception as e:
@@ -660,6 +881,30 @@ async def handle_obs_event(request):
         agent.trigger_video_end_event(remaining_sec)
     return web.json_response({"success": True, "event": event_type}, headers={"Access-Control-Allow-Origin": "*"})
 
+async def handle_flip_horizontal(request):
+    body = await request.json() if request.can_read_body else {}
+    source_name = body.get("source_name")
+    res = agent.flip_source(direction="horizontal", source_name=source_name)
+    return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
+
+async def handle_flip_vertical(request):
+    body = await request.json() if request.can_read_body else {}
+    source_name = body.get("source_name")
+    res = agent.flip_source(direction="vertical", source_name=source_name)
+    return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
+
+async def handle_transform_flip(request):
+    body = await request.json() if request.can_read_body else {}
+    direction = body.get("direction", "horizontal")
+    source_name = body.get("source_name")
+    res = agent.flip_source(direction=direction, source_name=source_name)
+    return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
+
+async def handle_transform_status(request):
+    source_name = request.query.get("source_name")
+    res = agent.get_transform_status(source_name=source_name)
+    return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
+
 def init_app():
     app = web.Application()
     app.cleanup_ctx.append(start_background_tasks)
@@ -671,6 +916,10 @@ def init_app():
     app.router.add_get("/api/camera-event", handle_camera_event)
     app.router.add_get("/api/videos", handle_list_videos)
     app.router.add_post("/api/switch-video", handle_switch_video)
+    app.router.add_post("/api/flip-horizontal", handle_flip_horizontal)
+    app.router.add_post("/api/flip-vertical", handle_flip_vertical)
+    app.router.add_post("/api/transform/flip", handle_transform_flip)
+    app.router.add_get("/api/transform/status", handle_transform_status)
     app.router.add_post("/api/stream/go-live", handle_go_live)
     app.router.add_post("/api/stream/end", handle_end_stream)
     app.router.add_post("/api/virtual-cam/start", handle_virtual_cam_start)

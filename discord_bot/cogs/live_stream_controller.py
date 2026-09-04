@@ -95,6 +95,47 @@ class LiveStreamAPIService:
                 return {"success": False, "error": str(e)}
 
     @classmethod
+    async def flip_horizontal(cls, creator: str, source_name: str = "Media") -> Dict:
+        ep = cls.get_endpoints(creator)
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(
+                    f"{ep['obs_agent_url']}/api/flip-horizontal",
+                    json={"source_name": source_name},
+                    timeout=3
+                ) as resp:
+                    return await resp.json()
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
+    @classmethod
+    async def flip_vertical(cls, creator: str, source_name: str = "Media") -> Dict:
+        ep = cls.get_endpoints(creator)
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(
+                    f"{ep['obs_agent_url']}/api/flip-vertical",
+                    json={"source_name": source_name},
+                    timeout=3
+                ) as resp:
+                    return await resp.json()
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
+    @classmethod
+    async def get_transform_status(cls, creator: str, source_name: str = "Media") -> Dict:
+        ep = cls.get_endpoints(creator)
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(
+                    f"{ep['obs_agent_url']}/api/transform/status?source_name={source_name}",
+                    timeout=3
+                ) as resp:
+                    return await resp.json()
+            except Exception as e:
+                return {"flipped_h": False, "flipped_v": False, "error": str(e)}
+
+    @classmethod
     async def toggle_virtual_cam(cls, creator: str, start: bool = True) -> Dict:
         ep = cls.get_endpoints(creator)
         action = "start" if start else "stop"
@@ -445,15 +486,27 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
         videos = await LiveStreamAPIService.list_videos(self.selected_creator)
 
         is_connected = status_data.get("is_connected", False)
-        active_video = status_data.get("input_name", "No Media Active")
+        active_video = status_data.get("active_video") or status_data.get("input_name", "No Media Active")
         dur_sec = status_data.get("duration_sec", 0.0)
         rem_sec = status_data.get("remaining_sec", 0.0)
         state_str = status_data.get("state", "OFFLINE")
+        flipped_h = status_data.get("flipped_h", False)
+        flipped_v = status_data.get("flipped_v", False)
 
         # Format timers
         dur_fmt = f"{int(dur_sec // 60):02d}:{int(dur_sec % 60):02d}"
         rem_fmt = f"{int(rem_sec // 60):02d}:{int(rem_sec % 60):02d}"
         media_info = f"`{active_video}` ({rem_fmt} left of {dur_fmt})" if dur_sec > 0 else f"`{active_video}`"
+
+        # Format orientation
+        if flipped_h and flipped_v:
+            orientation_info = "↔️↕️ Mirrored (H+V)"
+        elif flipped_h:
+            orientation_info = "↔️ Flipped Horizontal"
+        elif flipped_v:
+            orientation_info = "↕️ Flipped Vertical"
+        else:
+            orientation_info = "Normal (Default)"
 
         obs_status = "🟢 Connected" if is_connected else "🔴 Disconnected"
         stream_status = "🟢 Streaming (Live)" if is_connected and dur_sec > 0 else "⚪ Standby"
@@ -477,7 +530,8 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
                 f"**Creator**  ›  `@{self.selected_creator}`\n"
                 f"**OBS Node**  ›  {obs_status}\n"
                 f"**Live Status**  ›  {stream_status}\n"
-                f"**Active Clip**  ›  {media_info}\n"
+                f"**Selected Video**  ›  {media_info}\n"
+                f"**Orientation**  ›  `{orientation_info}`\n"
                 f"**Auto-Loop Reset**  ›  `10.0s` (Triggers at 5s remaining)"
             )
         ))
@@ -510,15 +564,17 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
             video_row = discord.ui.ActionRow()
             options = []
             for v in videos[:25]:  # Discord select max 25 items
+                is_current = (v.lower() == active_video.lower())
                 options.append(discord.SelectOption(
                     label=v[:100],
                     value=v,
-                    description=f"Switch OBS playback to {v[:40]}",
-                    emoji="🎬"
+                    description=f"{'▶️ Currently Playing' if is_current else f'Switch OBS playback to {v[:35]}'}"[:100],
+                    emoji="▶️" if is_current else "🎬",
+                    default=is_current
                 ))
 
             video_select = discord.ui.Select(
-                placeholder="🎬 Choose Video Clip to Play in OBS...",
+                placeholder=f"🎬 Selected: {active_video[:50]}",
                 options=options,
                 custom_id="video_select_dropdown"
             )
@@ -598,7 +654,50 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
         settings_btn.callback = on_settings
         actions_row.add_item(settings_btn)
 
-        # Refresh Dashboard
+        # ── OBS Controls ActionRow ──
+        obs_row = discord.ui.ActionRow()
+
+        # [ ↔️ Flip Horizontal ] Button
+        flip_h_label = "Unflip Horizontal" if flipped_h else "Flip Horizontal"
+        flip_h_btn = discord.ui.Button(
+            label=flip_h_label,
+            style=discord.ButtonStyle.primary if flipped_h else discord.ButtonStyle.secondary,
+            emoji="↔️",
+            custom_id="btn_flip_horizontal"
+        )
+        async def on_flip_h(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            res = await LiveStreamAPIService.flip_horizontal(self.selected_creator)
+            if res.get("success"):
+                mode = "Mirrored" if res.get("flipped_h") else "Normal"
+                await interaction.followup.send(f"↔️ **Horizontal Flip toggled ({mode}) for @{self.selected_creator}!**", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ Failed to flip horizontal: {res.get('error', 'Unknown error')}", ephemeral=True)
+            await self.refresh_dashboard(interaction)
+        flip_h_btn.callback = on_flip_h
+        obs_row.add_item(flip_h_btn)
+
+        # [ ↕️ Flip Vertical ] Button
+        flip_v_label = "Unflip Vertical" if flipped_v else "Flip Vertical"
+        flip_v_btn = discord.ui.Button(
+            label=flip_v_label,
+            style=discord.ButtonStyle.primary if flipped_v else discord.ButtonStyle.secondary,
+            emoji="↕️",
+            custom_id="btn_flip_vertical"
+        )
+        async def on_flip_v(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            res = await LiveStreamAPIService.flip_vertical(self.selected_creator)
+            if res.get("success"):
+                mode = "Flipped" if res.get("flipped_v") else "Normal"
+                await interaction.followup.send(f"↕️ **Vertical Flip toggled ({mode}) for @{self.selected_creator}!**", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ Failed to flip vertical: {res.get('error', 'Unknown error')}", ephemeral=True)
+            await self.refresh_dashboard(interaction)
+        flip_v_btn.callback = on_flip_v
+        obs_row.add_item(flip_v_btn)
+
+        # Refresh Dashboard Button
         refresh_btn = discord.ui.Button(
             label="Refresh",
             style=discord.ButtonStyle.secondary,
@@ -608,9 +707,10 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
         async def on_refresh(interaction: discord.Interaction):
             await self.refresh_dashboard(interaction)
         refresh_btn.callback = on_refresh
-        actions_row.add_item(refresh_btn)
+        obs_row.add_item(refresh_btn)
 
         container.add_item(actions_row)
+        container.add_item(obs_row)
         return container
 
     async def render(self) -> None:
@@ -1006,6 +1106,54 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
             await ctx.send(f"✅ **@{username} has been unbanned for @{creator_clean}!**")
         else:
             await ctx.send(f"⚠️ Failed to unban @{username}: {res.get('error', 'Unknown error')}")
+
+    @app_commands.command(name="flip-horizontal", description="Toggle Horizontal Flip (Mirror) in OBS Studio for a model")
+    @app_commands.describe(model="Creator model name (default: xsophiex)")
+    async def cmd_flip_horizontal(self, interaction: discord.Interaction, model: Optional[str] = "xsophiex"):
+        """Toggles horizontal flip on OBS video media source."""
+        await interaction.response.defer(ephemeral=True)
+        creator_clean = (model or "xsophiex").lower().replace("@", "").strip()
+        res = await LiveStreamAPIService.flip_horizontal(creator=creator_clean)
+        if res.get("success"):
+            state = "Mirrored" if res.get("flipped_h") else "Normal"
+            await interaction.followup.send(f"↔️ **OBS Horizontal Flip toggled ({state}) for @{creator_clean}!**", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ Failed to flip horizontal: {res.get('error', 'Unknown error')}", ephemeral=True)
+
+    @app_commands.command(name="flip-vertical", description="Toggle Vertical Flip in OBS Studio for a model")
+    @app_commands.describe(model="Creator model name (default: xsophiex)")
+    async def cmd_flip_vertical(self, interaction: discord.Interaction, model: Optional[str] = "xsophiex"):
+        """Toggles vertical flip on OBS video media source."""
+        await interaction.response.defer(ephemeral=True)
+        creator_clean = (model or "xsophiex").lower().replace("@", "").strip()
+        res = await LiveStreamAPIService.flip_vertical(creator=creator_clean)
+        if res.get("success"):
+            state = "Flipped" if res.get("flipped_v") else "Normal"
+            await interaction.followup.send(f"↕️ **OBS Vertical Flip toggled ({state}) for @{creator_clean}!**", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ Failed to flip vertical: {res.get('error', 'Unknown error')}", ephemeral=True)
+
+    @commands.command(name="fliph")
+    async def prefix_flip_h(self, ctx: commands.Context, model: Optional[str] = "xsophiex"):
+        """Prefix command: !fliph [model]"""
+        creator_clean = (model or "xsophiex").lower().replace("@", "").strip()
+        res = await LiveStreamAPIService.flip_horizontal(creator=creator_clean)
+        if res.get("success"):
+            state = "Mirrored" if res.get("flipped_h") else "Normal"
+            await ctx.send(f"↔️ **OBS Horizontal Flip toggled ({state}) for @{creator_clean}!**")
+        else:
+            await ctx.send(f"❌ Failed to flip horizontal: {res.get('error', 'Unknown error')}")
+
+    @commands.command(name="flipv")
+    async def prefix_flip_v(self, ctx: commands.Context, model: Optional[str] = "xsophiex"):
+        """Prefix command: !flipv [model]"""
+        creator_clean = (model or "xsophiex").lower().replace("@", "").strip()
+        res = await LiveStreamAPIService.flip_vertical(creator=creator_clean)
+        if res.get("success"):
+            state = "Flipped" if res.get("flipped_v") else "Normal"
+            await ctx.send(f"↕️ **OBS Vertical Flip toggled ({state}) for @{creator_clean}!**")
+        else:
+            await ctx.send(f"❌ Failed to flip vertical: {res.get('error', 'Unknown error')}")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
