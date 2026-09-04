@@ -38,6 +38,7 @@ class F2FLiveSocketClient:
         self.chat_seq_counter: int = 0
         self.seen_message_ids: set = set()
         self.chat_token: str = ""
+        self.has_joined_room: bool = False
         self.last_raw_packet: str = ""
         self.last_error: str = ""
         self.last_packet_time: float = 0
@@ -64,20 +65,46 @@ class F2FLiveSocketClient:
                 headers=headers,
                 cookies=cookies
             )
+            if live_resp.status_code == 401:
+                logger.warning(f"🔄 [@{self.creator_handle}] Session expired (401). Re-authenticating...")
+                await creator_client.login()
+                headers = creator_client._get_headers()
+                cookies = creator_client._get_cookies()
+                live_resp = await creator_client.session.get(
+                    f"https://f2f.com/api/creators/{self.creator_handle}/livestream/",
+                    headers=headers,
+                    cookies=cookies
+                )
+
             if live_resp.status_code == 200:
                 live_data = live_resp.json()
-                channel_name = live_data.get("channel_name", "")
-                self.active_livestream_uuid = live_data.get("uuid", "")
+                channel_name = live_data.get("channel_name") or live_data.get("channel") or ""
+                self.active_livestream_uuid = live_data.get("uuid") or live_data.get("id") or ""
                 if channel_name:
                     self.active_channel_name = channel_name
                     logger.info(f"📺 [@{self.creator_handle}] Discovered Live Channel: '{channel_name}' (UUID: {self.active_livestream_uuid})")
         except Exception as e:
             logger.debug(f"Live details fetch error for @{self.creator_handle}: {e}")
 
+        # If livestream UUID was already discovered by creator_client (e.g. FYP loop), reuse it!
+        if not self.active_livestream_uuid and creator_client.active_livestream_uuid:
+            self.active_livestream_uuid = creator_client.active_livestream_uuid
+
+        # Fallback channel name to creator handle so it is NEVER blank
+        if not channel_name:
+            channel_name = self.creator_handle
+            self.active_channel_name = channel_name
+
         # 2. Fetch Official F2F Socket Token (Required for Socket.IO authentication)
         socket_url = "https://f2f.com/api/socket/token/"
         try:
             resp = await creator_client.session.get(socket_url, headers=headers, cookies=cookies)
+            if resp.status_code == 401:
+                await creator_client.login()
+                headers = creator_client._get_headers()
+                cookies = creator_client._get_cookies()
+                resp = await creator_client.session.get(socket_url, headers=headers, cookies=cookies)
+
             if resp.status_code == 200:
                 data = resp.json()
                 t = data.get("token")
@@ -92,7 +119,12 @@ class F2FLiveSocketClient:
         try:
             resp_chat = await creator_client.session.get(chat_token_url, headers=headers, cookies=cookies)
             if resp_chat.status_code == 200:
-                self.chat_token = resp_chat.json().get("token", "")
+                data_chat = resp_chat.json()
+                self.chat_token = data_chat.get("token", "")
+                ch = data_chat.get("channel_name") or data_chat.get("channel")
+                if ch:
+                    self.active_channel_name = str(ch)
+                    channel_name = str(ch)
                 if self.chat_token:
                     logger.info(f"🔑 [@{self.creator_handle}] Retrieved Creator Chat Room Token for room joining!")
         except Exception as e:
@@ -184,10 +216,12 @@ class F2FLiveSocketClient:
                     self.is_connected = True
 
                     # 4. Join the Creator's Live Chat Room via official F2F "livestream:chat:user:join" packet!
-                    if self.active_channel_name and self.chat_token:
-                        join_packet = "42" + json.dumps(["livestream:chat:user:join", self.active_channel_name, self.chat_token])
-                        await ws.send_str(join_packet)
-                        logger.info(f"🚪 [@{self.creator_handle}] Dispatched 'livestream:chat:user:join' to room '{self.active_channel_name}'!")
+                    target_channel = self.active_channel_name or self.creator_handle
+                    join_packet = "42" + json.dumps(["livestream:chat:user:join", target_channel, self.chat_token or ""])
+                    await ws.send_str(join_packet)
+                    self.has_joined_room = True
+                    self.joined_channel_name = target_channel
+                    logger.info(f"🚪 [@{self.creator_handle}] Dispatched 'livestream:chat:user:join' to room '{target_channel}'!")
 
                     # 5. Launch background stream monitor task to auto-join if creator goes live mid-session
                     monitor_task = asyncio.create_task(self._stream_monitor_loop(ws))
@@ -213,10 +247,10 @@ class F2FLiveSocketClient:
                 await asyncio.sleep(5)
 
     async def _stream_monitor_loop(self, ws):
-        """Continuously checks if creator switches channel or starts a new stream while socket is connected."""
+        """Continuously checks if creator switches channel, starts a new stream, or if session expires."""
         while not ws.closed and self.is_connected:
             try:
-                await asyncio.sleep(15)
+                await asyncio.sleep(4)
                 creator_client = creator_manager.get_or_create_creator(self.creator_handle)
                 headers = creator_client._get_headers()
                 cookies = creator_client._get_cookies()
@@ -225,13 +259,57 @@ class F2FLiveSocketClient:
                     headers=headers,
                     cookies=cookies
                 )
+                if live_resp.status_code == 401:
+                    logger.warning(f"🔄 [@{self.creator_handle}] Session expired (401). Re-authenticating...")
+                    await creator_client.login()
+                    continue
+
+                if live_resp.status_code in (404, 204, 400):
+                    # Stream is offline or ended
+                    if getattr(self, "has_joined_room", False):
+                        logger.info(f"ℹ️ [@{self.creator_handle}] Livestream offline / ended (HTTP {live_resp.status_code}). Resetting room state for next stream...")
+                        self.has_joined_room = False
+                        self.joined_channel_name = ""
+                        self.active_livestream_uuid = ""
+                    continue
+
                 if live_resp.status_code == 200:
                     live_data = live_resp.json()
-                    new_channel = live_data.get("channel_name", "")
-                    if new_channel and self.active_channel_name and new_channel != self.active_channel_name:
-                        logger.info(f"🔄 [@{self.creator_handle}] Livestream channel changed from '{self.active_channel_name}' to '{new_channel}'. Cycling socket to re-authenticate and auto-join!")
-                        await ws.close()
-                        break
+                    new_channel = live_data.get("channel_name") or live_data.get("channel") or ""
+                    new_uuid = str(live_data.get("uuid") or live_data.get("id") or "")
+
+                    if not new_channel:
+                        if getattr(self, "has_joined_room", False):
+                            self.has_joined_room = False
+                            self.joined_channel_name = ""
+                        continue
+
+                    # Check if brand new stream, new channel, or room needs joining
+                    is_new_stream = (
+                        (new_channel != getattr(self, "joined_channel_name", "")) or
+                        (new_uuid and new_uuid != self.active_livestream_uuid) or
+                        not getattr(self, "has_joined_room", False)
+                    )
+
+                    if is_new_stream:
+                        logger.info(f"📺 [@{self.creator_handle}] New / restarted livestream active! (Channel: '{new_channel}', UUID: '{new_uuid}'). Auto-joining room...")
+                        self.active_channel_name = new_channel
+                        self.active_livestream_uuid = new_uuid
+
+                        # Fetch fresh chat token
+                        chat_token_url = f"https://f2f.com/api/creators/{self.creator_handle}/livestream/chat/token"
+                        try:
+                            resp_chat = await creator_client.session.get(chat_token_url, headers=headers, cookies=cookies)
+                            if resp_chat.status_code == 200:
+                                self.chat_token = resp_chat.json().get("token", "")
+                        except Exception:
+                            pass
+
+                        join_packet = "42" + json.dumps(["livestream:chat:user:join", self.active_channel_name, self.chat_token or ""])
+                        await ws.send_str(join_packet)
+                        self.has_joined_room = True
+                        self.joined_channel_name = self.active_channel_name
+                        logger.info(f"🚪 [@{self.creator_handle}] Successfully joined live room: '{self.active_channel_name}'!")
             except Exception as e:
                 logger.debug(f"Stream monitor tick error: {e}")
 
@@ -369,6 +447,19 @@ class F2FLiveSocketClient:
         except Exception as e:
             logger.error(f"❌ Error deleting live chat over WebSocket: {e}")
             return False
+
+    def find_message_id(self, text: str = "", username: str = "") -> Optional[str]:
+        """Finds matching message ID in recent chat queue by text and/or username."""
+        text_clean = text.strip().lower()
+        user_clean = username.strip().lower()
+        for item in reversed(self.incoming_chat_queue):
+            item_text = (item.get("text") or "").strip().lower()
+            item_user = (item.get("username") or "").strip().lower()
+            if text_clean and item_text and (text_clean == item_text or text_clean in item_text):
+                return str(item.get("id"))
+            if user_clean and item_user and user_clean == item_user:
+                return str(item.get("id"))
+        return None
 
     def get_incoming_chats(self, since_seq: int = 0) -> List[Dict]:
         """Returns new live chats since sequence ID."""

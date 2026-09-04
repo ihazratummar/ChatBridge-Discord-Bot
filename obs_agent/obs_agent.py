@@ -28,12 +28,10 @@ parser.add_argument("--obs-port", type=int, default=int(os.getenv("OBS_PORT", "4
 parser.add_argument("--obs-password", default=os.getenv("OBS_PASSWORD", ""), help="OBS WebSocket password")
 args, _ = parser.parse_known_args()
 
-# Model-specific video folder (e.g. videos/xsophiex/ or fallback to videos/)
+# Auto-create model subfolder (e.g. videos/xsophiex/)
 CREATOR_VIDEOS_DIR = os.path.join(BASE_VIDEOS_DIR, args.creator)
-if os.path.exists(CREATOR_VIDEOS_DIR):
-    VIDEOS_DIR = CREATOR_VIDEOS_DIR
-else:
-    VIDEOS_DIR = BASE_VIDEOS_DIR
+os.makedirs(CREATOR_VIDEOS_DIR, exist_ok=True)
+VIDEOS_DIR = CREATOR_VIDEOS_DIR
 
 def load_config():
     cfg = {
@@ -253,13 +251,28 @@ class OBSAgentManager:
             daemon=True
         ).start()
 
+    def get_creator_videos_dir(self) -> str:
+        creator = self.config.get("selected_creator", args.creator)
+        c_dir = os.path.join(BASE_VIDEOS_DIR, creator)
+        os.makedirs(c_dir, exist_ok=True)
+        return c_dir
+
     def list_available_videos(self):
-        videos = []
-        if os.path.exists(VIDEOS_DIR):
-            for f in os.listdir(VIDEOS_DIR):
+        videos = set()
+        # 1. Check creator-specific folder (e.g. videos/xsophiex/)
+        c_dir = self.get_creator_videos_dir()
+        if os.path.exists(c_dir):
+            for f in os.listdir(c_dir):
                 if f.lower().endswith((".mp4", ".mov", ".mkv", ".avi", ".webm")):
-                    videos.append(f)
-        return sorted(videos)
+                    videos.add(f)
+
+        # 2. Check shared root folder (videos/) for common clips
+        if os.path.exists(BASE_VIDEOS_DIR):
+            for f in os.listdir(BASE_VIDEOS_DIR):
+                if os.path.isfile(os.path.join(BASE_VIDEOS_DIR, f)) and f.lower().endswith((".mp4", ".mov", ".mkv", ".avi", ".webm")):
+                    videos.add(f)
+
+        return sorted(list(videos))
 
     def switch_video(self, video_name: str):
         if not self.is_connected or not self.obs_client:
@@ -267,9 +280,15 @@ class OBSAgentManager:
             if not self.is_connected:
                 return {"success": False, "error": "Not connected to OBS"}
 
-        video_path = os.path.join(VIDEOS_DIR, video_name)
+        c_dir = self.get_creator_videos_dir()
+        # 1. Search in creator-specific folder
+        video_path = os.path.join(c_dir, video_name)
         if not os.path.exists(video_path):
-            return {"success": False, "error": f"Video file '{video_name}' not found in {VIDEOS_DIR}"}
+            # 2. Search in shared root folder
+            video_path = os.path.join(BASE_VIDEOS_DIR, video_name)
+
+        if not os.path.exists(video_path):
+            return {"success": False, "error": f"Video file '{video_name}' not found in {c_dir} or {BASE_VIDEOS_DIR}"}
 
         try:
             input_name = self.current_media_input or self.find_active_media_input() or "Media"
@@ -279,7 +298,7 @@ class OBSAgentManager:
                 overlay=True
             )
             self.last_triggered_time = time.time()
-            logger.info(f"🎬 Successfully switched OBS Media source '{input_name}' to: {video_name}")
+            logger.info(f"🎬 Successfully switched OBS Media source '{input_name}' to: {video_name} ({video_path})")
             return {"success": True, "active_video": video_name, "input_name": input_name}
         except Exception as e:
             logger.error(f"Failed to switch video: {e}")
@@ -538,12 +557,34 @@ async def handle_delete_chat(request):
 chat_counter = 0
 
 async def handle_incoming_chat(request):
-    # DOM scraper chat input is permanently disabled. Live chat is handled by FastAPI.
-    return web.json_response({"status": "disabled", "chat": None}, headers={"Access-Control-Allow-Origin": "*"})
+    global chat_counter, incoming_chat_queue
+    try:
+        body = await request.json()
+        chat_counter += 1
+        chat_data = {
+            "seq_id": chat_counter,
+            "id": body.get("id") or f"obs_{chat_counter}_{int(time.time()*1000)}",
+            "username": (body.get("username") or "Fan").strip(),
+            "text": (body.get("text") or body.get("content") or "").strip(),
+            "type": body.get("type", "chat"),
+            "tip_amount": float(body.get("tip_amount", 0) or 0),
+            "timestamp": time.time()
+        }
+        incoming_chat_queue.append(chat_data)
+        if len(incoming_chat_queue) > 200:
+            incoming_chat_queue = incoming_chat_queue[-200:]
+        return web.json_response({"status": "ok", "seq_id": chat_counter, "chat": chat_data}, headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)}, status=400, headers={"Access-Control-Allow-Origin": "*"})
 
 async def handle_get_incoming_chats(request):
-    # DOM scraper queue is permanently disabled. Live chat is handled by FastAPI.
-    return web.json_response({"chats": [], "max_seq": 0, "timestamp": time.time()}, headers={"Access-Control-Allow-Origin": "*"})
+    global chat_counter, incoming_chat_queue
+    try:
+        since_seq = int(request.query.get("since_seq", 0))
+    except (ValueError, TypeError):
+        since_seq = 0
+    chats = [c for c in incoming_chat_queue if c.get("seq_id", 0) > since_seq]
+    return web.json_response({"chats": chats, "max_seq": chat_counter, "timestamp": time.time()}, headers={"Access-Control-Allow-Origin": "*"})
 
 async def handle_clear_incoming_chats(request):
     global chat_counter, incoming_chat_queue

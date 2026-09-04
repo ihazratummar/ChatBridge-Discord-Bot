@@ -247,6 +247,34 @@ class F2FLiveClient:
             logger.error(f"Error switching audience for @{self.creator_handle}: {e}")
         return False
 
+    async def set_tip_goal(self, tip_goal: int) -> bool:
+        """
+        Updates the active livestream tip goal amount.
+        """
+        if not self.is_authenticated and self.password:
+            await self.login()
+
+        if not self.active_livestream_uuid:
+            await self.get_active_livestream()
+
+        if not self.active_livestream_uuid:
+            logger.info(f"ℹ️ [TIP GOAL] Creator @{self.creator_handle} is not live on F2F. Skipping tip goal update.")
+            return False
+
+        url = f"{BASE_URL}/livestreams/{self.active_livestream_uuid}/tipgoal/"
+        payload = {"tip_goal": tip_goal}
+
+        try:
+            resp = await self.session.post(url, json=payload, headers=self._get_headers(), cookies=self._get_cookies())
+            if resp.status_code in (200, 201, 204):
+                logger.info(f"✅ Tip goal updated for @{self.creator_handle} -> €{tip_goal}")
+                return True
+            else:
+                logger.warning(f"⚠️ Failed to update tip goal ({resp.status_code}): {resp.text[:100]}")
+        except Exception as e:
+            logger.error(f"Error updating tip goal for @{self.creator_handle}: {e}")
+        return False
+
     async def handle_video_ending_pause(self, delay_sec: float = 10.0):
         """
         Pauses or switches audience on video end, waits for loop delay, then resumes smoothly.
