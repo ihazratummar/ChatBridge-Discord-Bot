@@ -7,6 +7,7 @@ switching preloaded videos in real-time, and relaying live chat comments.
 
 import os
 import re
+import io
 import json
 import time
 import logging
@@ -47,6 +48,53 @@ DEFAULT_VPS_ENDPOINTS = {
 class LiveStreamAPIService:
     """Helper to communicate with individual VPS OBS Agents and FastAPI servers."""
 
+    VIDEOS_CACHE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "videos_cache.json")
+    _cached_videos: Dict[str, List[str]] = {}
+    _obs_preview_xsophiex: bool = True
+    _obs_preview_chantalkuyt: bool = True
+    _obs_preview_aylen: bool = True
+    _obs_preview_zoelynn: bool = True
+    _obs_preview_chantalkuytmistress: bool = True
+
+    @classmethod
+    def _load_cached_videos(cls) -> Dict[str, List[str]]:
+        try:
+            if os.path.exists(cls.VIDEOS_CACHE_PATH):
+                with open(cls.VIDEOS_CACHE_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        for k, v in data.items():
+                            existing = cls._cached_videos.setdefault(k, [])
+                            for item in v:
+                                if item not in existing:
+                                    existing.append(item)
+                            existing.sort()
+        except Exception as e:
+            logger.debug(f"Error loading videos cache: {e}")
+        return cls._cached_videos
+
+    @classmethod
+    def _save_cached_videos(cls):
+        try:
+            os.makedirs(os.path.dirname(cls.VIDEOS_CACHE_PATH), exist_ok=True)
+            with open(cls.VIDEOS_CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump(cls._cached_videos, f, indent=2)
+        except Exception as e:
+            logger.debug(f"Error saving videos cache: {e}")
+
+    @classmethod
+    def add_video_to_cache(cls, creator: str, video_name: str) -> List[str]:
+        if not video_name or video_name in ["No Media Active", "Media"]:
+            return cls._cached_videos.get(creator.lower().replace("@", "").strip(), [])
+        creator_clean = creator.lower().replace("@", "").strip()
+        cls._load_cached_videos()
+        vids = cls._cached_videos.setdefault(creator_clean, [])
+        if video_name not in vids:
+            vids.append(video_name)
+            vids.sort()
+            cls._save_cached_videos()
+        return vids
+
     @staticmethod
     def get_endpoints(creator: str) -> Dict[str, str]:
         creator_clean = creator.lower().replace("@", "").strip()
@@ -56,84 +104,404 @@ class LiveStreamAPIService:
         })
 
     @classmethod
+    async def _send_obs_ws_request(cls, host: str, port: int, request_type: str, request_data: Optional[Dict] = None, timeout: float = 6.0) -> Dict:
+        """Direct pure aiohttp WebSocket call to OBS Studio (port 4455), requiring NO external libraries."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(f"ws://{host}:{port}", timeout=timeout) as ws:
+                    await ws.receive_json()
+                    await ws.send_json({"op": 1, "d": {"rpcVersion": 1, "eventSubscriptions": 0}})
+                    await ws.receive_json()
+
+                    req_id = f"req_{int(time.time()*1000)}"
+                    req_payload = {
+                        "op": 6,
+                        "d": {
+                            "requestType": request_type,
+                            "requestId": req_id,
+                            "requestData": request_data or {}
+                        }
+                    }
+                    await ws.send_json(req_payload)
+                    for _ in range(15):
+                        msg = await asyncio.wait_for(ws.receive_json(), timeout=timeout)
+                        if msg.get("op") == 7 and msg.get("d", {}).get("requestId") == req_id:
+                            d = msg.get("d", {})
+                            if d.get("requestStatus", {}).get("result"):
+                                return {"success": True, "data": d.get("responseData", {})}
+                            else:
+                                return {"success": False, "error": d.get("requestStatus", {}).get("comment", "Request failed")}
+                    return {"success": False, "error": "Timeout waiting for OBS response"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @classmethod
+    async def _get_obs_status_direct(cls, host: str, port: int = 4455, creator: str = "xsophiex", timeout: float = 3.0) -> Dict:
+        """Direct OBS WebSocket status fetcher using pure aiohttp. Zero external dependencies."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(f"ws://{host}:{port}", timeout=timeout) as ws:
+                    await ws.receive_json()
+                    await ws.send_json({"op": 1, "d": {"rpcVersion": 1, "eventSubscriptions": 0}})
+                    await ws.receive_json()
+
+                    # 1. Media Input Status
+                    await ws.send_json({
+                        "op": 6,
+                        "d": {"requestType": "GetMediaInputStatus", "requestId": "media_stat", "requestData": {"inputName": "Media"}}
+                    })
+                    r1 = await ws.receive_json()
+                    media_data = r1.get("d", {}).get("responseData", {})
+
+                    # 2. Media Input Settings
+                    await ws.send_json({
+                        "op": 6,
+                        "d": {"requestType": "GetInputSettings", "requestId": "media_settings", "requestData": {"inputName": "Media"}}
+                    })
+                    r2 = await ws.receive_json()
+                    settings_data = r2.get("d", {}).get("responseData", {})
+
+                    # 3. Scene items & Transform
+                    flipped_h = False
+                    flipped_v = False
+                    try:
+                        await ws.send_json({"op": 6, "d": {"requestType": "GetCurrentProgramScene", "requestId": "scene_cur"}})
+                        r3 = await ws.receive_json()
+                        scene_name = r3.get("d", {}).get("responseData", {}).get("currentProgramSceneName", "Scene")
+
+                        await ws.send_json({
+                            "op": 6,
+                            "d": {"requestType": "GetSceneItemList", "requestId": "scene_items", "requestData": {"sceneName": scene_name}}
+                        })
+                        r4 = await ws.receive_json()
+                        items = r4.get("d", {}).get("responseData", {}).get("sceneItems", [])
+                        for item in items:
+                            if item.get("sourceName") == "Media":
+                                t = item.get("sceneItemTransform", {})
+                                flipped_h = t.get("scaleX", 1.0) < 0
+                                flipped_v = t.get("scaleY", 1.0) < 0
+                                break
+                    except Exception:
+                        pass
+
+                    # 4. Stream status
+                    is_streaming = False
+                    try:
+                        await ws.send_json({"op": 6, "d": {"requestType": "GetStreamStatus", "requestId": "stream_stat"}})
+                        r5 = await ws.receive_json()
+                        is_streaming = r5.get("d", {}).get("responseData", {}).get("outputActive", False)
+                    except Exception:
+                        pass
+
+                    local_file = settings_data.get("inputSettings", {}).get("local_file", "")
+                    filename = os.path.basename(local_file) if local_file else "No Media Active"
+                    if filename and filename not in ["No Media Active", "Media"]:
+                        cls.add_video_to_cache(creator, filename)
+                    dur_sec = float(media_data.get("mediaDuration", 0) or 0) / 1000.0
+                    cur_sec = float(media_data.get("mediaCursor", 0) or 0) / 1000.0
+                    rem_sec = max(0.0, dur_sec - cur_sec)
+                    obs_preview_enabled = getattr(cls, f"_obs_preview_{creator}", True)
+
+                    return {
+                        "input_name": "Media",
+                        "active_video": filename,
+                        "duration_sec": dur_sec,
+                        "cursor_sec": cur_sec,
+                        "remaining_sec": rem_sec,
+                        "state": media_data.get("mediaState", "OBS_MEDIA_STATE_PLAYING" if dur_sec > 0 else "OBS_MEDIA_STATE_STOPPED"),
+                        "flipped_h": flipped_h,
+                        "flipped_v": flipped_v,
+                        "obs_preview_enabled": obs_preview_enabled,
+                        "is_streaming": is_streaming,
+                        "is_connected": True,
+                        "status": "online"
+                    }
+        except Exception as e:
+            logger.debug(f"Direct OBS WS status fetch failed for {host}:{port}: {e}")
+            return {"status": "offline", "is_connected": False, "error": str(e)}
+
+    @classmethod
     async def get_status(cls, creator: str) -> Dict:
         ep = cls.get_endpoints(creator)
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(f"{ep['obs_agent_url']}/api/status", timeout=2) as resp:
+        creator_clean = creator.lower().replace("@", "").strip()
+        # 1. Primary: Try OBS Agent HTTP server on port 8081 with fast 0.4s connect timeout
+        try:
+            to = aiohttp.ClientTimeout(total=0.6, connect=0.4)
+            async with aiohttp.ClientSession(timeout=to) as session:
+                async with session.get(f"{ep['obs_agent_url']}/api/status") as resp:
                     if resp.status == 200:
-                        return await resp.json()
-            except Exception as e:
-                logger.debug(f"Error fetching status from {ep['obs_agent_url']}: {e}")
-        return {"status": "offline", "is_connected": False}
+                        data = await resp.json()
+                        if data.get("is_connected"):
+                            return data
+        except Exception as e:
+            logger.debug(f"Error fetching status from {ep['obs_agent_url']}: {e}")
+
+        # 2. Resilient Direct Fallback: Native OBS WebSocket on port 4455
+        import urllib.parse
+        parsed = urllib.parse.urlparse(ep['obs_agent_url'])
+        host = parsed.hostname or "159.69.64.80"
+        return await cls._get_obs_status_direct(host, 4455, creator_clean)
 
     @classmethod
     async def list_videos(cls, creator: str) -> List[str]:
         ep = cls.get_endpoints(creator)
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(f"{ep['obs_agent_url']}/api/videos", timeout=2) as resp:
+        creator_clean = creator.lower().replace("@", "").strip()
+        cls._load_cached_videos()
+        try:
+            to = aiohttp.ClientTimeout(total=3.0, connect=2.0)
+            async with aiohttp.ClientSession(timeout=to) as session:
+                async with session.get(f"{ep['obs_agent_url']}/api/videos") as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        return data.get("videos", [])
-            except Exception as e:
-                logger.debug(f"Error fetching videos: {e}")
-        return []
+                        vids = data.get("videos", [])
+                        if vids:
+                            cls._cached_videos[creator_clean] = vids
+                            cls._save_cached_videos()
+                            return vids
+        except Exception as e:
+            logger.debug(f"Error fetching videos from agent for {creator_clean}: {e}")
+        return cls._cached_videos.get(creator_clean, [])
 
     @classmethod
     async def switch_video(cls, creator: str, video_name: str) -> Dict:
         ep = cls.get_endpoints(creator)
-        async with aiohttp.ClientSession() as session:
-            try:
+        creator_clean = creator.lower().replace("@", "").strip()
+        # 1. Try OBS Agent HTTP server
+        try:
+            to = aiohttp.ClientTimeout(total=3.0, connect=2.0)
+            async with aiohttp.ClientSession(timeout=to) as session:
                 async with session.post(
                     f"{ep['obs_agent_url']}/api/switch-video",
-                    json={"video_name": video_name},
-                    timeout=3
+                    json={"video_name": video_name}
                 ) as resp:
-                    return await resp.json()
-            except Exception as e:
-                return {"success": False, "error": str(e)}
+                    if resp.status == 200:
+                        return await resp.json()
+        except Exception:
+            pass
+
+        # 2. Resilient Direct Fallback: Native OBS WebSocket on port 4455
+        try:
+            import urllib.parse
+            parsed = urllib.parse.urlparse(ep['obs_agent_url'])
+            host = parsed.hostname or "159.69.64.80"
+            target_path = f"/root/Desktop/obs_agent/videos/{creator_clean}/{video_name}"
+            res = await cls._send_obs_ws_request(host, 4455, "SetInputSettings", {
+                "inputName": "Media",
+                "inputSettings": {"local_file": target_path}
+            })
+            if res.get("success"):
+                return {"success": True, "video": video_name}
+            return {"success": False, "error": res.get("error", "Switch failed")}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @classmethod
+    async def _flip_source_obs_ws(cls, host: str, port: int, direction: str = "horizontal", source_name: str = "Media") -> Dict:
+        """Flips source horizontally or vertically directly via OBS WebSocket."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(f"ws://{host}:{port}", timeout=3.0) as ws:
+                    await ws.receive_json()
+                    await ws.send_json({"op": 1, "d": {"rpcVersion": 1, "eventSubscriptions": 0}})
+                    await ws.receive_json()
+
+                    await ws.send_json({"op": 6, "d": {"requestType": "GetCurrentProgramScene", "requestId": "scene_cur"}})
+                    r1 = await ws.receive_json()
+                    scene_name = r1.get("d", {}).get("responseData", {}).get("currentProgramSceneName", "Scene")
+
+                    await ws.send_json({"op": 6, "d": {"requestType": "GetSceneItemList", "requestId": "scene_items", "requestData": {"sceneName": scene_name}}})
+                    r2 = await ws.receive_json()
+                    items = r2.get("d", {}).get("responseData", {}).get("sceneItems", [])
+                    
+                    target_item = None
+                    for item in items:
+                        if item.get("sourceName") == source_name:
+                            target_item = item
+                            break
+                    if not target_item:
+                        return {"success": False, "error": f"Source '{source_name}' not found"}
+
+                    item_id = target_item.get("sceneItemId")
+                    t = target_item.get("sceneItemTransform", {})
+                    scale_x = float(t.get("scaleX", 1.0))
+                    scale_y = float(t.get("scaleY", 1.0))
+
+                    new_transform = {}
+                    if "horiz" in direction.lower() or direction.lower() == "h":
+                        new_scale_x = -scale_x
+                        new_transform["scaleX"] = new_scale_x
+                        flipped_h = new_scale_x < 0
+                        flipped_v = scale_y < 0
+                    else:
+                        new_scale_y = -scale_y
+                        new_transform["scaleY"] = new_scale_y
+                        flipped_h = scale_x < 0
+                        flipped_v = new_scale_y < 0
+
+                    await ws.send_json({
+                        "op": 6,
+                        "d": {
+                            "requestType": "SetSceneItemTransform",
+                            "requestId": "set_transform",
+                            "requestData": {
+                                "sceneName": scene_name,
+                                "sceneItemId": item_id,
+                                "sceneItemTransform": new_transform
+                            }
+                        }
+                    })
+                    r3 = await ws.receive_json()
+                    status = r3.get("d", {}).get("requestStatus", {})
+                    if status.get("result"):
+                        return {"success": True, "flipped_h": flipped_h, "flipped_v": flipped_v}
+                    return {"success": False, "error": status.get("comment", "Transform update failed")}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     @classmethod
     async def flip_horizontal(cls, creator: str, source_name: str = "Media") -> Dict:
         ep = cls.get_endpoints(creator)
-        async with aiohttp.ClientSession() as session:
-            try:
+        try:
+            to = aiohttp.ClientTimeout(total=0.6, connect=0.4)
+            async with aiohttp.ClientSession(timeout=to) as session:
                 async with session.post(
                     f"{ep['obs_agent_url']}/api/flip-horizontal",
-                    json={"source_name": source_name},
-                    timeout=3
+                    json={"source_name": source_name}
                 ) as resp:
-                    return await resp.json()
-            except Exception as e:
-                return {"success": False, "error": str(e)}
+                    if resp.status == 200:
+                        return await resp.json()
+        except Exception:
+            pass
+
+        # Fallback to direct OBS WebSocket
+        import urllib.parse
+        parsed = urllib.parse.urlparse(ep['obs_agent_url'])
+        host = parsed.hostname or "159.69.64.80"
+        return await cls._flip_source_obs_ws(host, 4455, direction="horizontal", source_name=source_name)
 
     @classmethod
     async def flip_vertical(cls, creator: str, source_name: str = "Media") -> Dict:
         ep = cls.get_endpoints(creator)
-        async with aiohttp.ClientSession() as session:
-            try:
+        try:
+            to = aiohttp.ClientTimeout(total=0.6, connect=0.4)
+            async with aiohttp.ClientSession(timeout=to) as session:
                 async with session.post(
                     f"{ep['obs_agent_url']}/api/flip-vertical",
-                    json={"source_name": source_name},
-                    timeout=3
+                    json={"source_name": source_name}
                 ) as resp:
-                    return await resp.json()
-            except Exception as e:
-                return {"success": False, "error": str(e)}
+                    if resp.status == 200:
+                        return await resp.json()
+        except Exception:
+            pass
+
+        # Fallback to direct OBS WebSocket
+        import urllib.parse
+        parsed = urllib.parse.urlparse(ep['obs_agent_url'])
+        host = parsed.hostname or "159.69.64.80"
+        return await cls._flip_source_obs_ws(host, 4455, direction="vertical", source_name=source_name)
 
     @classmethod
     async def get_transform_status(cls, creator: str, source_name: str = "Media") -> Dict:
         ep = cls.get_endpoints(creator)
-        async with aiohttp.ClientSession() as session:
-            try:
+        creator_clean = creator.lower().replace("@", "").strip()
+        try:
+            to = aiohttp.ClientTimeout(total=0.6, connect=0.4)
+            async with aiohttp.ClientSession(timeout=to) as session:
                 async with session.get(
-                    f"{ep['obs_agent_url']}/api/transform/status?source_name={source_name}",
-                    timeout=3
+                    f"{ep['obs_agent_url']}/api/transform/status?source_name={source_name}"
                 ) as resp:
-                    return await resp.json()
-            except Exception as e:
-                return {"flipped_h": False, "flipped_v": False, "error": str(e)}
+                    if resp.status == 200:
+                        return await resp.json()
+        except Exception:
+            pass
+
+        # Fallback via direct OBS WS status
+        try:
+            import urllib.parse
+            parsed = urllib.parse.urlparse(ep['obs_agent_url'])
+            host = parsed.hostname or "159.69.64.80"
+            st = await cls._get_obs_status_direct(host, 4455, creator_clean)
+            if st.get("is_connected"):
+                return {"flipped_h": st.get("flipped_h", False), "flipped_v": st.get("flipped_v", False)}
+        except Exception:
+            pass
+        return {"flipped_h": False, "flipped_v": False}
+
+    @classmethod
+    async def get_preview_image(cls, creator: str, source_name: str = "Media") -> Optional[bytes]:
+        ep = cls.get_endpoints(creator)
+        try:
+            to = aiohttp.ClientTimeout(total=0.8, connect=0.4)
+            async with aiohttp.ClientSession(timeout=to) as session:
+                ts = int(time.time() * 1000)
+                async with session.get(
+                    f"{ep['obs_agent_url']}/api/preview.jpg?source_name={source_name}&t={ts}"
+                ) as resp:
+                    if resp.status == 200 and resp.headers.get("content-type", "").startswith("image/"):
+                        return await resp.read()
+        except Exception as e:
+            logger.debug(f"Error fetching preview image for {creator}: {e}")
+        return None
+
+    @classmethod
+    async def toggle_obs_preview(cls, creator: str, enable: Optional[bool] = None) -> Dict:
+        """Enables or disables the visual canvas preview in OBS Studio on the VPS."""
+        ep = cls.get_endpoints(creator)
+        creator_clean = creator.lower().replace("@", "").strip()
+        # 1. Primary: Try OBS Agent HTTP endpoint (8081)
+        try:
+            to = aiohttp.ClientTimeout(total=0.6, connect=0.4)
+            async with aiohttp.ClientSession(timeout=to) as session:
+                payload = {}
+                if enable is not None:
+                    payload["enable"] = enable
+                async with session.post(
+                    f"{ep['obs_agent_url']}/api/obs-preview/toggle",
+                    json=payload
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        setattr(cls, f"_obs_preview_{creator_clean}", data.get("preview_enabled", True))
+                        return data
+        except Exception:
+            pass
+
+        # 2. Resilient Direct Fallback: Direct OBS WebSocket (port 4455 on VPS) using pure aiohttp
+        try:
+            import urllib.parse
+            parsed = urllib.parse.urlparse(ep['obs_agent_url'])
+            host = parsed.hostname or "159.69.64.80"
+            port = 4455
+            current_state = getattr(cls, f"_obs_preview_{creator_clean}", True)
+            target_state = (not current_state) if enable is None else bool(enable)
+            hotkey = "OBSBasic.EnablePreview" if target_state else "OBSBasic.DisablePreview"
+            res = await cls._send_obs_ws_request(host, port, "TriggerHotkeyByName", {"hotkeyName": hotkey})
+
+            if res.get("success"):
+                setattr(cls, f"_obs_preview_{creator_clean}", target_state)
+                return {"success": True, "preview_enabled": target_state}
+            else:
+                err = res.get("error") or "OBS hotkey request failed or timed out"
+                return {"success": False, "error": err}
+        except Exception as e:
+            return {"success": False, "error": str(e) or type(e).__name__ or "Unknown error"}
+
+    @classmethod
+    async def get_obs_preview_status(cls, creator: str) -> bool:
+        ep = cls.get_endpoints(creator)
+        creator_clean = creator.lower().replace("@", "").strip()
+        try:
+            to = aiohttp.ClientTimeout(total=0.6, connect=0.4)
+            async with aiohttp.ClientSession(timeout=to) as session:
+                async with session.get(
+                    f"{ep['obs_agent_url']}/api/obs-preview/status"
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("preview_enabled", True)
+        except Exception:
+            pass
+        return getattr(cls, f"_obs_preview_{creator_clean}", True)
 
     @classmethod
     async def toggle_virtual_cam(cls, creator: str, start: bool = True) -> Dict:
@@ -354,6 +722,16 @@ class LiveStreamAPIService:
             except Exception as e:
                 return {"success": False, "error": str(e)}
 
+    @classmethod
+    async def open_browser(cls, creator: str) -> Dict:
+        ep = cls.get_endpoints(creator)
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(f"{ep['obs_agent_url']}/api/stream/open-browser", timeout=5) as resp:
+                    return await resp.json()
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
 
 class GoLiveModal(discord.ui.Modal):
     def __init__(self, creator: str, on_success_callback):
@@ -487,11 +865,16 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
 
         is_connected = status_data.get("is_connected", False)
         active_video = status_data.get("active_video") or status_data.get("input_name", "No Media Active")
+        if active_video and active_video not in ["No Media Active", "Media"]:
+            LiveStreamAPIService.add_video_to_cache(self.selected_creator, active_video)
+            if active_video not in videos:
+                videos.insert(0, active_video)
         dur_sec = status_data.get("duration_sec", 0.0)
         rem_sec = status_data.get("remaining_sec", 0.0)
         state_str = status_data.get("state", "OFFLINE")
         flipped_h = status_data.get("flipped_h", False)
         flipped_v = status_data.get("flipped_v", False)
+        obs_preview_enabled = status_data.get("obs_preview_enabled", getattr(LiveStreamAPIService, f"_obs_preview_{self.selected_creator}", True))
 
         # Format timers
         dur_fmt = f"{int(dur_sec // 60):02d}:{int(dur_sec % 60):02d}"
@@ -510,6 +893,7 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
 
         obs_status = "🟢 Connected" if is_connected else "🔴 Disconnected"
         stream_status = "🟢 Streaming (Live)" if is_connected and dur_sec > 0 else "⚪ Standby"
+        preview_text = "🟢 Enabled (Rendering)" if obs_preview_enabled else "⚫ Disabled (CPU Saver)"
 
         # Build V2 Container
         container = discord.ui.Container(accent_color=discord.Color.from_str("#FF0080"))
@@ -532,6 +916,7 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
                 f"**Live Status**  ›  {stream_status}\n"
                 f"**Selected Video**  ›  {media_info}\n"
                 f"**Orientation**  ›  `{orientation_info}`\n"
+                f"**VPS Preview**  ›  `{preview_text}`\n"
                 f"**Auto-Loop Reset**  ›  `10.0s` (Triggers at 5s remaining)"
             )
         ))
@@ -550,6 +935,7 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
 
             async def make_model_callback(creator_name=c):
                 async def cb(interaction: discord.Interaction):
+                    await interaction.response.defer()
                     self.selected_creator = creator_name
                     await self.refresh_dashboard(interaction)
                 return cb
@@ -697,6 +1083,27 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
         flip_v_btn.callback = on_flip_v
         obs_row.add_item(flip_v_btn)
 
+        # [ 🖥️ OBS Preview ] Toggle Button (Enables / Disables canvas preview in VPS OBS)
+        preview_label = "Disable Preview" if obs_preview_enabled else "Enable Preview"
+        preview_btn = discord.ui.Button(
+            label=preview_label,
+            style=discord.ButtonStyle.secondary if obs_preview_enabled else discord.ButtonStyle.success,
+            emoji="🖥️",
+            custom_id="btn_toggle_obs_preview"
+        )
+        async def on_toggle_preview(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            res = await LiveStreamAPIService.toggle_obs_preview(self.selected_creator)
+            if res.get("success"):
+                mode = "Enabled (Rendering)" if res.get("preview_enabled") else "Disabled (CPU Saver)"
+                await interaction.followup.send(f"🖥️ **VPS OBS Canvas Preview set to `{mode}` for @{self.selected_creator}!**", ephemeral=True)
+            else:
+                err_msg = res.get("error") or "Request failed or timed out. Please verify OBS window is not in a modal menu."
+                await interaction.followup.send(f"❌ Failed to toggle OBS preview: {err_msg}", ephemeral=True)
+            await self.refresh_dashboard(interaction)
+        preview_btn.callback = on_toggle_preview
+        obs_row.add_item(preview_btn)
+
         # Refresh Dashboard Button
         refresh_btn = discord.ui.Button(
             label="Refresh",
@@ -724,9 +1131,13 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
             if not interaction.response.is_done():
                 await interaction.response.edit_message(view=self)
             else:
-                await interaction.edit_original_response(view=self)
+                try:
+                    await interaction.edit_original_response(view=self)
+                except Exception:
+                    if interaction.message:
+                        await interaction.message.edit(view=self)
         except Exception as e:
-            logger.debug(f"Dashboard edit note: {e}")
+            logger.warning(f"Dashboard edit note: {e}")
 
 
 # Persistent cache to map Discord message IDs to F2F live chat message items
@@ -1072,9 +1483,13 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
     async def stream_dashboard(self, interaction: discord.Interaction, model: Optional[str] = "xsophiex"):
         """Displays the interactive Components V2 Live Stream Control Dashboard."""
         await interaction.response.defer()
-        view = F2FLiveStreamDashboardView(author=interaction.user, initial_creator=model or "xsophiex")
-        await view.render()
-        await interaction.followup.send(view=view)
+        try:
+            view = F2FLiveStreamDashboardView(author=interaction.user, initial_creator=model or "xsophiex")
+            await view.render()
+            await interaction.followup.send(view=view)
+        except Exception as e:
+            logger.exception(f"Error opening stream dashboard: {e}")
+            await interaction.followup.send(f"❌ Failed to load stream dashboard: {e}", ephemeral=True)
 
     @app_commands.command(name="stream-video", description="Switch the active video clip playing in OBS for a model")
     @app_commands.describe(model="Creator model name (e.g. xsophiex)", video_name="Exact filename (e.g. video1.mp4)")
@@ -1154,6 +1569,58 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
             await ctx.send(f"↕️ **OBS Vertical Flip toggled ({state}) for @{creator_clean}!**")
         else:
             await ctx.send(f"❌ Failed to flip vertical: {res.get('error', 'Unknown error')}")
+
+    @app_commands.command(name="obs-preview", description="Toggle OBS Canvas Preview on the VPS (saves CPU when disabled)")
+    @app_commands.describe(model="Creator model name (default: xsophiex)")
+    async def cmd_obs_preview(self, interaction: discord.Interaction, model: Optional[str] = "xsophiex"):
+        """Toggles the visual preview display in OBS Studio on the VPS."""
+        await interaction.response.defer(ephemeral=True)
+        creator_clean = (model or "xsophiex").lower().replace("@", "").strip()
+        res = await LiveStreamAPIService.toggle_obs_preview(creator=creator_clean)
+        if res.get("success"):
+            state = "Enabled (Rendering)" if res.get("preview_enabled") else "Disabled (CPU Saver)"
+            await interaction.followup.send(f"🖥️ **VPS OBS Canvas Preview is now `{state}` for @{creator_clean}!**", ephemeral=True)
+        else:
+            err_msg = res.get("error") or "Request failed or timed out. Please verify OBS window is not in a modal menu."
+            await interaction.followup.send(f"❌ Failed to toggle OBS preview: {err_msg}", ephemeral=True)
+
+    @commands.command(name="preview")
+    async def prefix_preview(self, ctx: commands.Context, model: Optional[str] = "xsophiex"):
+        """Prefix command: !preview [model]"""
+        creator_clean = (model or "xsophiex").lower().replace("@", "").strip()
+        res = await LiveStreamAPIService.toggle_obs_preview(creator=creator_clean)
+        if res.get("success"):
+            state = "Enabled (Rendering)" if res.get("preview_enabled") else "Disabled (CPU Saver)"
+            await ctx.send(f"🖥️ **VPS OBS Canvas Preview is now `{state}` for @{creator_clean}!**")
+        else:
+            err_msg = res.get("error") or "Request failed or timed out. Please verify OBS window is not in a modal menu."
+            await ctx.send(f"❌ Failed to toggle OBS preview: {err_msg}")
+
+    @app_commands.command(name="stream-add-video", description="Register a video filename to the model's video dropdown menu")
+    @app_commands.describe(video_name="Exact filename (e.g. clip1.mp4)", model="Creator model name (default: xsophiex)")
+    async def cmd_add_video(self, interaction: discord.Interaction, video_name: str, model: Optional[str] = "xsophiex"):
+        """Adds a video filename to the model's video selection dropdown."""
+        await interaction.response.defer(ephemeral=True)
+        creator_clean = (model or "xsophiex").lower().replace("@", "").strip()
+        vids = LiveStreamAPIService.add_video_to_cache(creator_clean, video_name.strip())
+        await interaction.followup.send(f"✅ Added `{video_name.strip()}` to **@{creator_clean}**'s video dropdown! (Total registered: {len(vids)})", ephemeral=True)
+
+    @commands.command(name="addvideo")
+    async def prefix_add_video(self, ctx: commands.Context, video_name: str, model: Optional[str] = "xsophiex"):
+        """Prefix command: !addvideo <filename.mp4> [model]"""
+        creator_clean = (model or "xsophiex").lower().replace("@", "").strip()
+        vids = LiveStreamAPIService.add_video_to_cache(creator_clean, video_name.strip())
+        await ctx.send(f"✅ Added `{video_name.strip()}` to **@{creator_clean}**'s video dropdown! (Total registered: {len(vids)})")
+
+    @commands.command(name="browser", aliases=["openbrowser"])
+    async def prefix_open_browser(self, ctx: commands.Context, model: Optional[str] = None):
+        """Prefix command: !browser [model] - Launches / navigates Google Chrome to F2F Live page"""
+        creator_clean = (model or self.selected_creator or "xsophiex").lower().replace("@", "").strip()
+        res = await LiveStreamAPIService.open_browser(creator=creator_clean)
+        if res.get("success"):
+            await ctx.send(f"🌐 **Opened / Navigated Google Chrome to F2F Live page for @{creator_clean}!**")
+        else:
+            await ctx.send(f"❌ Failed to open browser: {res.get('error', 'Unknown error')}")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):

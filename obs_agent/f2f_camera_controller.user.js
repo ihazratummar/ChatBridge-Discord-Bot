@@ -7,6 +7,7 @@
 // @match        https://*.f2f.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @grant        window.close
 // @connect      127.0.0.1
 // @connect      localhost
 // @run-at       document-start
@@ -362,47 +363,76 @@
         return (input.value === value || input.value.length > 0);
     }
 
-    // ─── End Live Stream Automation (Bulletproof) ─────────────────
+    // ─── End Live Stream Automation (Bulletproof & Closes Tab) ───
+    function closeCurrentTab() {
+        console.log("[F2F-OBS] 🛑 Closing F2F Live tab cleanly...");
+        seenMessageIds.clear();
+        if (liveSocket) {
+            try { liveSocket.close(); } catch(e) {}
+        }
+        if (badge) {
+            badge.style.color = "#ef4444";
+            badge.innerText = "🛑 Stream Ended — Closing Tab...";
+        }
+
+        // 1. Privileged userscript close
+        try { window.close(); } catch(e) {}
+        try { unsafeWindow.close(); } catch(e) {}
+        try { pageWindow.close(); } catch(e) {}
+
+        // 2. Cascade fallback: replace with about:blank and close
+        setTimeout(function() {
+            try { window.close(); } catch(e) {}
+            try { pageWindow.location.replace("about:blank"); } catch(e) {}
+            setTimeout(function() {
+                try { window.close(); } catch(e) {}
+                try { unsafeWindow.close(); } catch(e) {}
+            }, 150);
+        }, 300);
+    }
+
     function executeEndStream() {
         console.log("[F2F-OBS] 🛑 Ending current livestream from Discord...");
-        var exitBtn = pageDoc.querySelector("div[class*='logoutIcon'], div[class*='logout'], div[class*='vjx7qW_logoutIcon'], div[class*='exitIcon']");
+        autoDismissModals();
+
+        // 1. Check if live exit button exists (when currently broadcasting)
+        var exitBtn = pageDoc.querySelector("div[class*='logoutIcon'], div[class*='logout'], div[class*='vjx7qW_logoutIcon'], div[class*='exitIcon'], button[class*='logout'], button[class*='exit'], [aria-label*='exit' i], [aria-label*='stop' i], [aria-label*='end' i]");
         if (!exitBtn) {
             var container = pageDoc.querySelector("div[class*='livestreamPlayerActions'], div[class*='vjx7qW_livestreamPlayerActions']");
             if (container) {
-                var btns = Array.from(container.querySelectorAll("div[class*='actionButton'], div[class*='logoutIcon'], div[role='button']"));
+                var btns = Array.from(container.querySelectorAll("div[class*='actionButton'], div[class*='logoutIcon'], div[role='button'], button"));
                 if (btns.length >= 2) exitBtn = btns[btns.length - 1];
             }
         }
+
         if (exitBtn) {
+            console.log("[F2F-OBS] 🎯 Clicking live stream exit button...");
             clickElementViaReact(exitBtn);
             try { exitBtn.click(); } catch(e) {}
-        }
-        var confirmAttempts = 0;
-        var confirmInterval = setInterval(function() {
-            confirmAttempts++;
-            var confirmBtns = Array.from(pageDoc.querySelectorAll("button, div[role='button']"));
-            var endConfirm = confirmBtns.find(function(b) {
-                var txt = (b.innerText || b.textContent || "").trim().toLowerCase();
-                return txt.includes("end") || txt.includes("yes") || txt.includes("confirm") || txt.includes("beëindigen") || txt.includes("stop");
-            });
-            if (endConfirm && endConfirm !== exitBtn) {
-                clearInterval(confirmInterval);
-                clickElementViaReact(endConfirm);
-                try { endConfirm.click(); } catch(e) {}
-            } else if (confirmAttempts >= 10) {
-                clearInterval(confirmInterval);
-            }
-        }, 200);
 
-        setTimeout(function() {
-            seenMessageIds.clear();
-            if (liveSocket) { try { liveSocket.close(); } catch(e) {} }
-            if (badge) {
-                badge.style.color = "#ef4444";
-                badge.innerText = "🛑 Stream Ended (Clean Reset)";
-            }
-            pageWindow.location.href = "https://f2f.com/live/";
-        }, 1200);
+            var confirmAttempts = 0;
+            var confirmInterval = setInterval(function() {
+                confirmAttempts++;
+                var confirmBtns = Array.from(pageDoc.querySelectorAll("button, div[role='button']"));
+                var endConfirm = confirmBtns.find(function(b) {
+                    var txt = (b.innerText || b.textContent || "").trim().toLowerCase();
+                    return (txt.includes("end") || txt.includes("yes") || txt.includes("confirm") || txt.includes("beëindigen") || txt.includes("stop")) && !txt.includes("go live") && !txt.includes("live gaan");
+                });
+                if (endConfirm && endConfirm !== exitBtn) {
+                    clearInterval(confirmInterval);
+                    console.log("[F2F-OBS] 🎯 Confirming stream termination...");
+                    clickElementViaReact(endConfirm);
+                    try { endConfirm.click(); } catch(e) {}
+                    setTimeout(closeCurrentTab, 1000);
+                } else if (confirmAttempts >= 10) {
+                    clearInterval(confirmInterval);
+                    closeCurrentTab();
+                }
+            }, 200);
+        } else {
+            console.log("[F2F-OBS] ℹ️ Stream is not actively broadcasting (or on setup/error screen). Closing tab immediately...");
+            closeCurrentTab();
+        }
     }
 
     // ─── Live Chat: Send & Delete ─────────────────────────────────

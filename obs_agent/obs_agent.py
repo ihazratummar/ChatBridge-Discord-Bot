@@ -8,6 +8,8 @@ from aiohttp import web
 import requests
 import threading
 import uuid
+import base64
+from typing import Dict, List, Optional
 
 # Configure logging
 logging.basicConfig(
@@ -308,6 +310,70 @@ class OBSAgentManager:
             logger.error(f"Failed to flip source transform: {e}")
             return {"success": False, "error": str(e)}
 
+    def toggle_obs_preview(self, enable: bool = None) -> Dict:
+        """Enables or disables the visual canvas preview in OBS Studio on the VPS."""
+        if not self.is_connected or not self.obs_client:
+            self.connect_obs()
+            if not self.is_connected:
+                return {"success": False, "error": "Not connected to OBS"}
+
+        try:
+            current_state = getattr(self, "obs_preview_enabled", True)
+            target_state = (not current_state) if enable is None else bool(enable)
+
+            hotkey = "OBSBasic.EnablePreview" if target_state else "OBSBasic.DisablePreview"
+            self.obs_client.trigger_hotkey_by_name(hotkey)
+
+            self.obs_preview_enabled = target_state
+            logger.info(f"🖥️ [OBS PREVIEW] Canvas Preview set to: {'ENABLED' if target_state else 'DISABLED'}")
+            return {"success": True, "preview_enabled": target_state}
+        except Exception as e:
+            logger.error(f"Failed toggling OBS preview: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_obs_preview_status(self) -> Dict:
+        """Returns the current OBS canvas preview status."""
+        return {
+            "success": True,
+            "preview_enabled": getattr(self, "obs_preview_enabled", True)
+        }
+
+    def get_preview_image(self, source_name: str = None, width: int = 960, height: int = 540, quality: int = 85):
+        """Captures a real-time JPEG snapshot frame of the active video playback or scene from OBS."""
+        if not self.is_connected or not self.obs_client:
+            self.connect_obs()
+            if not self.is_connected:
+                return None
+
+        target = source_name or self.current_media_input or self.find_active_media_input() or "Media"
+
+        # 1. Try taking screenshot of the target media input source
+        try:
+            res = self.obs_client.get_source_screenshot(target, "jpeg", width, height, quality)
+            img_data = getattr(res, "image_data", None) or (res.get("imageData") if isinstance(res, dict) else None)
+            if img_data:
+                if "," in img_data:
+                    img_data = img_data.split(",", 1)[1]
+                return base64.b64decode(img_data)
+        except Exception as e:
+            logger.debug(f"Source screenshot note ({target}): {e}")
+
+        # 2. Fallback: Try taking screenshot of the active program scene
+        try:
+            cur = self.obs_client.get_current_program_scene()
+            scene_name = getattr(cur, "current_program_scene_name", None) or getattr(cur, "scene_name", None)
+            if scene_name:
+                res = self.obs_client.get_source_screenshot(scene_name, "jpeg", width, height, quality)
+                img_data = getattr(res, "image_data", None) or (res.get("imageData") if isinstance(res, dict) else None)
+                if img_data:
+                    if "," in img_data:
+                        img_data = img_data.split(",", 1)[1]
+                    return base64.b64decode(img_data)
+        except Exception as e:
+            logger.debug(f"Scene screenshot note: {e}")
+
+        return None
+
     def find_active_media_input(self):
         if not self.is_connected or not self.obs_client:
             self.connect_obs()
@@ -405,7 +471,8 @@ class OBSAgentManager:
                 "active_creator": self.active_creator,
                 "is_connected": True,
                 "flipped_h": flipped_h,
-                "flipped_v": flipped_v
+                "flipped_v": flipped_v,
+                "obs_preview_enabled": getattr(self, "obs_preview_enabled", True)
             }
         except Exception as e:
             logger.error(f"Error polling media status: {e}")
@@ -567,23 +634,98 @@ class OBSAgentManager:
                 logger.debug(f"Profile lookup note: {e}")
         return "Default"
 
-    def get_active_display(self) -> str:
-        """Finds the active X11 display (XRDP session :10.0 or local :0)."""
-        if "DISPLAY" in os.environ and os.environ["DISPLAY"]:
-            return os.environ["DISPLAY"]
+    def get_x11_gui_env(self) -> dict:
+        """Dynamically inspects the active visible GUI session to extract the true DISPLAY and XAUTHORITY.
+        Inspects running OBS Studio and desktop processes first, since OBS is guaranteed to be on the visible screen."""
+        env = os.environ.copy()
+        display = env.get("DISPLAY")
+        xauth = env.get("XAUTHORITY")
+
+        # 1. First priority: Check running GUI processes (OBS Studio, desktop environments, RustDesk, etc.)
+        gui_processes = ["obs", "obs64", "xfce4-session", "gnome-shell", "x-session-manager", "rustdesk", "lightdm", "Xorg"]
+        import subprocess
+        for proc in gui_processes:
+            if display and xauth:
+                break
+            try:
+                pids = subprocess.check_output(["pgrep", "-f", proc], text=True, timeout=2).strip().split()
+                for pid in pids:
+                    environ_file = f"/proc/{pid}/environ"
+                    if os.path.exists(environ_file):
+                        try:
+                            with open(environ_file, "rb") as f:
+                                raw = f.read().split(b"\0")
+                                p_env = {}
+                                for entry in raw:
+                                    if b"=" in entry:
+                                        k, v = entry.split(b"=", 1)
+                                        try:
+                                            p_env[k.decode("latin1", errors="ignore")] = v.decode("latin1", errors="ignore")
+                                        except Exception:
+                                            pass
+                                if not display and p_env.get("DISPLAY"):
+                                    display = p_env["DISPLAY"]
+                                    logger.info(f"🖥️ Detected visible DISPLAY={display} from process '{proc}' (PID {pid})")
+                                if not xauth and p_env.get("XAUTHORITY"):
+                                    xauth = p_env["XAUTHORITY"]
+                                    logger.info(f"🔑 Detected XAUTHORITY={xauth} from process '{proc}' (PID {pid})")
+                                if display and xauth:
+                                    break
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+
+        # 2. If DISPLAY not found from processes, check active X11 sockets in /tmp/.X11-unix/
+        if not display:
+            try:
+                import glob
+                sockets = glob.glob("/tmp/.X11-unix/X*")
+                if sockets:
+                    nums = [s.split("X")[-1] for s in sockets]
+                    # Prioritize local display :0 or :1 before XRDP :10
+                    if "0" in nums:
+                        display = ":0"
+                    elif "1" in nums:
+                        display = ":1"
+                    elif "10" in nums:
+                        display = ":10.0"
+                    else:
+                        display = f":{nums[0]}"
+            except Exception:
+                pass
+
+        if not display:
+            display = ":0"
+
+        # 3. Fallback for XAUTHORITY if still missing
+        if not xauth:
+            possible_auths = [
+                os.path.expanduser("~/.Xauthority"),
+                "/root/.Xauthority",
+                f"/run/user/{os.getuid()}/gdm/Xauthority" if hasattr(os, "getuid") else ""
+            ]
+            for p in possible_auths:
+                if p and os.path.exists(p):
+                    xauth = p
+                    break
+
+        env["DISPLAY"] = display
+        if xauth:
+            env["XAUTHORITY"] = xauth
+
+        # Authorize root on X server if xhost is available
         try:
-            import glob
-            sockets = glob.glob("/tmp/.X11-unix/X*")
-            if sockets:
-                nums = [s.split("X")[-1] for s in sockets]
-                if "10" in nums:
-                    return ":10.0"
-                if "0" in nums:
-                    return ":0"
-                return f":{nums[-1]}.0"
+            subprocess.run(["xhost", "+local:root"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
         except Exception:
             pass
-        return ":10.0"
+
+        return env
+
+    def get_active_display(self) -> str:
+        """Finds the active X11 display."""
+        env = self.get_x11_gui_env()
+        return env.get("DISPLAY", ":0")
 
     def _is_chrome_running_for_creator(self, creator: str) -> bool:
         """Check if Chrome is already running with this creator's dedicated data directory."""
@@ -602,27 +744,46 @@ class OBSAgentManager:
         return False
 
     def ensure_browser_open(self):
-        """Launches Google Chrome to F2F Live page with dedicated isolated profile per model.
-        Uses --user-data-dir and --password-store=basic to guarantee 100% permanent login sessions."""
+        """Ensures Google Chrome is open and navigated to F2F Live page with dedicated isolated profile per model.
+        Uses --user-data-dir and --password-store=basic to guarantee 100% permanent login sessions.
+        If Chrome is already running, passes target URL to the active instance and focuses window."""
         try:
             creator = self.active_creator.lower()
-            if self._is_chrome_running_for_creator(creator):
-                logger.info(f"🌐 Chrome is already running for @{creator} — session preserved.")
-                return
-
-            import subprocess
-            import platform
-            system = platform.system()
             target_url = "https://f2f.com/live/"
             profile_dir = os.path.expanduser(f"~/.config/chrome-profiles/{creator}")
             os.makedirs(profile_dir, exist_ok=True)
 
+            is_running = self._is_chrome_running_for_creator(creator)
+
+            # If not running, clean up any stale lock that might prevent Chrome from starting
+            if not is_running:
+                lock_file = os.path.join(profile_dir, "SingletonLock")
+                if os.path.islink(lock_file) or os.path.exists(lock_file):
+                    try:
+                        os.unlink(lock_file)
+                        logger.info(f"🧹 Cleaned orphaned Chrome SingletonLock for @{creator}")
+                    except Exception as e:
+                        logger.debug(f"SingletonLock cleanup note: {e}")
+
+            import subprocess
+            import platform
+            import shutil
+            system = platform.system()
+
             if system == "Linux":
-                env = os.environ.copy()
-                display = self.get_active_display()
-                env["DISPLAY"] = display
+                env = self.get_x11_gui_env()
+                display = env.get("DISPLAY", ":0")
+
+                chrome_bin = (
+                    shutil.which("google-chrome") or
+                    shutil.which("google-chrome-stable") or
+                    shutil.which("chromium-browser") or
+                    shutil.which("chromium") or
+                    "/usr/bin/google-chrome"
+                )
+
                 cmd = [
-                    "google-chrome",
+                    chrome_bin,
                     target_url,
                     f"--user-data-dir={profile_dir}",
                     "--password-store=basic",
@@ -636,8 +797,32 @@ class OBSAgentManager:
                     "--disable-background-timer-throttling",
                     "--disable-renderer-backgrounding"
                 ]
-                subprocess.Popen(cmd, env=env)
-                logger.info(f"🌐 Launched isolated Google Chrome for @{creator} (Dir: {profile_dir}) on DISPLAY={display}")
+
+                # Root execution on Linux strictly requires --no-sandbox
+                try:
+                    if os.geteuid() == 0:
+                        cmd.append("--no-sandbox")
+                except AttributeError:
+                    cmd.append("--no-sandbox")
+
+                subprocess.Popen(
+                    cmd,
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True
+                )
+
+                # If Chrome was already running, attempt to bring the window to front using wmctrl or xdotool
+                if is_running:
+                    logger.info(f"🌐 Navigated existing Chrome session for @{creator} to {target_url} on DISPLAY={display}")
+                    try:
+                        subprocess.run(["wmctrl", "-a", "Google Chrome"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
+                    except Exception:
+                        pass
+                else:
+                    logger.info(f"🌐 Launched fresh isolated Google Chrome for @{creator} (Dir: {profile_dir}) on DISPLAY={display}")
+
             elif system == "Darwin":
                 cmd = [
                     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -668,13 +853,45 @@ class OBSAgentManager:
         logger.info(f"🚀 Triggered 'Go Live' for @{self.active_creator} (Title: '{title}')")
         return {"success": True, "action": "go_live", "title": title}
 
+    def close_f2f_browser_tab(self):
+        """OS-level safety net: attempts to close the F2F Live Chrome tab if still open."""
+        try:
+            import subprocess
+            import platform
+            if platform.system() == "Linux":
+                env = self.get_x11_gui_env()
+                try:
+                    out = subprocess.check_output(
+                        ["xdotool", "search", "--onlyvisible", "--name", "Live.*Chrome|F2F.*Chrome|Chrome.*Live|f2f.com/live"],
+                        env=env, text=True, timeout=2
+                    ).strip()
+                    for wid in out.split():
+                        subprocess.run(
+                            ["xdotool", "windowactivate", "--sync", wid, "key", "--clearmodifiers", "ctrl+w"],
+                            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2
+                        )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"Note on tab close helper: {e}")
+
     def trigger_end_stream(self):
         camera_event_state["event_id"] += 1
         camera_event_state["action"] = "end_stream"
         camera_event_state["timestamp"] = time.time()
         incoming_chat_queue.clear()
-        self.stop_virtual_cam()
-        logger.info(f"🛑 Triggered 'End Stream' for @{self.active_creator} — All live chat memory cleared.")
+        broadcast_ws_event({"action": "end_stream", "creator": self.active_creator})
+
+        # Graceful shutdown: give the browser 2.5 seconds to cleanly execute end-stream and close tab BEFORE cutting OBS virtual camera
+        import threading
+        def delayed_stop_cam():
+            time.sleep(2.5)
+            self.stop_virtual_cam()
+            self.close_f2f_browser_tab()
+            logger.info(f"🛑 Cleanly stopped OBS Virtual Cam and closed F2F tab for @{self.active_creator}")
+
+        threading.Thread(target=delayed_stop_cam, daemon=True).start()
+        logger.info(f"🛑 Triggered 'End Stream' for @{self.active_creator} — Broadcast closing.")
         return {"success": True, "action": "end_stream"}
 
     def send_live_chat(self, text: str):
@@ -738,6 +955,10 @@ async def handle_switch_video(request):
         return web.json_response({"success": False, "error": "No video_name provided"}, status=400)
     result = agent.switch_video(video_name)
     return web.json_response(result)
+
+async def handle_open_browser(request):
+    agent.ensure_browser_open()
+    return web.json_response({"success": True, "action": "open_browser", "creator": agent.active_creator})
 
 async def handle_go_live(request):
     body = await request.json() if request.can_read_body else {}
@@ -905,6 +1126,37 @@ async def handle_transform_status(request):
     res = agent.get_transform_status(source_name=source_name)
     return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
 
+async def handle_preview_image(request):
+    source_name = request.query.get("source_name")
+    try:
+        w = int(request.query.get("width", 960))
+        h = int(request.query.get("height", 540))
+        q = int(request.query.get("quality", 85))
+    except (ValueError, TypeError):
+        w, h, q = 960, 540, 85
+
+    img_bytes = agent.get_preview_image(source_name=source_name, width=w, height=h, quality=q)
+    if img_bytes:
+        return web.Response(
+            body=img_bytes,
+            content_type="image/jpeg",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-cache, no-store, must-revalidate"
+            }
+        )
+    return web.json_response({"success": False, "error": "Could not capture OBS preview"}, status=503)
+
+async def handle_toggle_obs_preview(request):
+    body = await request.json() if request.can_read_body else {}
+    enable = body.get("enable")
+    res = agent.toggle_obs_preview(enable=enable)
+    return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
+
+async def handle_obs_preview_status(request):
+    res = agent.get_obs_preview_status()
+    return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
+
 def init_app():
     app = web.Application()
     app.cleanup_ctx.append(start_background_tasks)
@@ -915,11 +1167,18 @@ def init_app():
     app.router.add_get("/api/config", handle_get_config)
     app.router.add_get("/api/camera-event", handle_camera_event)
     app.router.add_get("/api/videos", handle_list_videos)
+    app.router.add_get("/api/preview", handle_preview_image)
+    app.router.add_get("/api/preview.jpg", handle_preview_image)
+    app.router.add_get("/api/screenshot", handle_preview_image)
+    app.router.add_post("/api/obs-preview/toggle", handle_toggle_obs_preview)
+    app.router.add_get("/api/obs-preview/status", handle_obs_preview_status)
     app.router.add_post("/api/switch-video", handle_switch_video)
     app.router.add_post("/api/flip-horizontal", handle_flip_horizontal)
     app.router.add_post("/api/flip-vertical", handle_flip_vertical)
     app.router.add_post("/api/transform/flip", handle_transform_flip)
     app.router.add_get("/api/transform/status", handle_transform_status)
+    app.router.add_post("/api/stream/open-browser", handle_open_browser)
+    app.router.add_get("/api/stream/open-browser", handle_open_browser)
     app.router.add_post("/api/stream/go-live", handle_go_live)
     app.router.add_post("/api/stream/end", handle_end_stream)
     app.router.add_post("/api/virtual-cam/start", handle_virtual_cam_start)
