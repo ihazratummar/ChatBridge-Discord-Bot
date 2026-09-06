@@ -5,7 +5,7 @@ echo "========================================================="
 echo " 🌐 F2F Bulletproof Multi-Model Chrome Profile Setup"
 echo "========================================================="
 
-MODELS=("xsophiex" "chantalkuyt" "aylen" "zoelynn")
+MODELS=("xsophiex" "chantalkuyt" "aylen" "zoelynn" "chantalkuytmistress")
 DESKTOP_DIR="/root/Desktop"
 mkdir -p "$DESKTOP_DIR"
 
@@ -21,7 +21,7 @@ for MODEL in "${MODELS[@]}"; do
 Version=1.0
 Type=Application
 Name=Chrome ($MODEL)
-Exec=google-chrome --user-data-dir=$PROFILE_DIR --password-store=basic --use-fake-ui-for-media-stream --no-first-run --no-default-browser-check --autoplay-policy=no-user-gesture-required --disable-dev-shm-usage --enable-gpu-rasterization --ignore-gpu-blocklist --disable-background-timer-throttling --disable-renderer-backgrounding https://f2f.com/live/
+Exec=google-chrome --user-data-dir=$PROFILE_DIR --password-store=basic --disable-features=WebRTCPipeWireCapturer --no-first-run --no-default-browser-check --autoplay-policy=no-user-gesture-required --disable-dev-shm-usage --enable-gpu-rasterization --ignore-gpu-blocklist --disable-background-timer-throttling --disable-renderer-backgrounding https://f2f.com/live/
 Icon=google-chrome
 Path=/root
 Terminal=false

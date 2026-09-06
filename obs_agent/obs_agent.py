@@ -787,7 +787,7 @@ class OBSAgentManager:
                     target_url,
                     f"--user-data-dir={profile_dir}",
                     "--password-store=basic",
-                    "--use-fake-ui-for-media-stream",
+                    "--disable-features=WebRTCPipeWireCapturer",
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--autoplay-policy=no-user-gesture-required",
