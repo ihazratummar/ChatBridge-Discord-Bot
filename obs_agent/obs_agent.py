@@ -931,7 +931,9 @@ incoming_chat_queue = []
 agent = OBSAgentManager()
 
 async def handle_status(request):
-    data = agent.poll_media_status() or {"status": "disconnected"}
+    data = agent.poll_media_status() or {"status": "disconnected", "is_connected": False}
+    if isinstance(data, dict) and "is_connected" not in data:
+        data["is_connected"] = bool(agent.is_connected)
     return web.json_response(data)
 
 async def handle_get_config(request):

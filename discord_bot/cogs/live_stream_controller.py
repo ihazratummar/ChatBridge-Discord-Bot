@@ -25,22 +25,27 @@ DEFAULT_VPS_ENDPOINTS = {
     "xsophiex": {
         "obs_agent_url": os.getenv("OBS_AGENT_URL_XSOPHIEX", "http://159.69.64.80:8081"),
         "fastapi_url": os.getenv("FASTAPI_URL_XSOPHIEX", "http://77.237.241.68:8000"),
+        "obs_ws_port": int(os.getenv("OBS_WS_PORT_XSOPHIEX", "4455")),
     },
     "chantalkuyt": {
         "obs_agent_url": os.getenv("OBS_AGENT_URL_CHANTALKUYT", "http://159.69.64.80:8082"),
         "fastapi_url": os.getenv("FASTAPI_URL_CHANTALKUYT", "http://77.237.241.68:8000"),
+        "obs_ws_port": int(os.getenv("OBS_WS_PORT_CHANTALKUYT", "4456")),
     },
     "aylen": {
         "obs_agent_url": os.getenv("OBS_AGENT_URL_AYLEN", "http://159.69.64.80:8083"),
         "fastapi_url": os.getenv("FASTAPI_URL_AYLEN", "http://77.237.241.68:8000"),
+        "obs_ws_port": int(os.getenv("OBS_WS_PORT_AYLEN", "4457")),
     },
     "zoelynn": {
         "obs_agent_url": os.getenv("OBS_AGENT_URL_ZOELYNN", "http://159.69.64.80:8084"),
         "fastapi_url": os.getenv("FASTAPI_URL_ZOELYNN", "http://77.237.241.68:8000"),
+        "obs_ws_port": int(os.getenv("OBS_WS_PORT_ZOELYNN", "4458")),
     },
     "chantalkuytmistress": {
         "obs_agent_url": os.getenv("OBS_AGENT_URL_CHANTALKUYTMISTRESS", "http://159.69.64.80:8085"),
         "fastapi_url": os.getenv("FASTAPI_URL_CHANTALKUYTMISTRESS", "http://77.237.241.68:8000"),
+        "obs_ws_port": int(os.getenv("OBS_WS_PORT_CHANTALKUYTMISTRESS", "4459")),
     }
 }
 
@@ -63,12 +68,7 @@ class LiveStreamAPIService:
                 with open(cls.VIDEOS_CACHE_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     if isinstance(data, dict):
-                        for k, v in data.items():
-                            existing = cls._cached_videos.setdefault(k, [])
-                            for item in v:
-                                if item not in existing:
-                                    existing.append(item)
-                            existing.sort()
+                        cls._cached_videos = {k: list(v) for k, v in data.items() if isinstance(v, list)}
         except Exception as e:
             logger.debug(f"Error loading videos cache: {e}")
         return cls._cached_videos
@@ -224,23 +224,25 @@ class LiveStreamAPIService:
     async def get_status(cls, creator: str) -> Dict:
         ep = cls.get_endpoints(creator)
         creator_clean = creator.lower().replace("@", "").strip()
-        # 1. Primary: Try OBS Agent HTTP server on port 8081 with fast 0.4s connect timeout
+        obs_port = ep.get("obs_ws_port", 4455)
+        # 1. Primary: Try OBS Agent HTTP server on that model's dedicated port
         try:
-            to = aiohttp.ClientTimeout(total=0.6, connect=0.4)
+            to = aiohttp.ClientTimeout(total=0.8, connect=0.5)
             async with aiohttp.ClientSession(timeout=to) as session:
                 async with session.get(f"{ep['obs_agent_url']}/api/status") as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        if data.get("is_connected"):
-                            return data
+                        if isinstance(data, dict) and "is_connected" not in data:
+                            data["is_connected"] = (data.get("status") not in ("disconnected", "offline", "no_media_source"))
+                        return data
         except Exception as e:
             logger.debug(f"Error fetching status from {ep['obs_agent_url']}: {e}")
 
-        # 2. Resilient Direct Fallback: Native OBS WebSocket on port 4455
+        # 2. Resilient Direct Fallback: Native OBS WebSocket on that model's dedicated port
         import urllib.parse
         parsed = urllib.parse.urlparse(ep['obs_agent_url'])
         host = parsed.hostname or "159.69.64.80"
-        return await cls._get_obs_status_direct(host, 4455, creator_clean)
+        return await cls._get_obs_status_direct(host, obs_port, creator_clean)
 
     @classmethod
     async def list_videos(cls, creator: str) -> List[str]:
@@ -248,16 +250,15 @@ class LiveStreamAPIService:
         creator_clean = creator.lower().replace("@", "").strip()
         cls._load_cached_videos()
         try:
-            to = aiohttp.ClientTimeout(total=3.0, connect=2.0)
+            to = aiohttp.ClientTimeout(total=2.0, connect=1.0)
             async with aiohttp.ClientSession(timeout=to) as session:
                 async with session.get(f"{ep['obs_agent_url']}/api/videos") as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         vids = data.get("videos", [])
-                        if vids:
-                            cls._cached_videos[creator_clean] = vids
-                            cls._save_cached_videos()
-                            return vids
+                        cls._cached_videos[creator_clean] = vids
+                        cls._save_cached_videos()
+                        return vids
         except Exception as e:
             logger.debug(f"Error fetching videos from agent for {creator_clean}: {e}")
         return cls._cached_videos.get(creator_clean, [])
@@ -266,6 +267,7 @@ class LiveStreamAPIService:
     async def switch_video(cls, creator: str, video_name: str) -> Dict:
         ep = cls.get_endpoints(creator)
         creator_clean = creator.lower().replace("@", "").strip()
+        obs_port = ep.get("obs_ws_port", 4455)
         # 1. Try OBS Agent HTTP server
         try:
             to = aiohttp.ClientTimeout(total=3.0, connect=2.0)
@@ -279,13 +281,13 @@ class LiveStreamAPIService:
         except Exception:
             pass
 
-        # 2. Resilient Direct Fallback: Native OBS WebSocket on port 4455
+        # 2. Resilient Direct Fallback: Native OBS WebSocket on that model's dedicated port
         try:
             import urllib.parse
             parsed = urllib.parse.urlparse(ep['obs_agent_url'])
             host = parsed.hostname or "159.69.64.80"
             target_path = f"/root/Desktop/obs_agent/videos/{creator_clean}/{video_name}"
-            res = await cls._send_obs_ws_request(host, 4455, "SetInputSettings", {
+            res = await cls._send_obs_ws_request(host, obs_port, "SetInputSettings", {
                 "inputName": "Media",
                 "inputSettings": {"local_file": target_path}
             })
@@ -377,7 +379,8 @@ class LiveStreamAPIService:
         import urllib.parse
         parsed = urllib.parse.urlparse(ep['obs_agent_url'])
         host = parsed.hostname or "159.69.64.80"
-        return await cls._flip_source_obs_ws(host, 4455, direction="horizontal", source_name=source_name)
+        obs_port = ep.get("obs_ws_port", 4455)
+        return await cls._flip_source_obs_ws(host, obs_port, direction="horizontal", source_name=source_name)
 
     @classmethod
     async def flip_vertical(cls, creator: str, source_name: str = "Media") -> Dict:
@@ -398,12 +401,14 @@ class LiveStreamAPIService:
         import urllib.parse
         parsed = urllib.parse.urlparse(ep['obs_agent_url'])
         host = parsed.hostname or "159.69.64.80"
-        return await cls._flip_source_obs_ws(host, 4455, direction="vertical", source_name=source_name)
+        obs_port = ep.get("obs_ws_port", 4455)
+        return await cls._flip_source_obs_ws(host, obs_port, direction="vertical", source_name=source_name)
 
     @classmethod
     async def get_transform_status(cls, creator: str, source_name: str = "Media") -> Dict:
         ep = cls.get_endpoints(creator)
         creator_clean = creator.lower().replace("@", "").strip()
+        obs_port = ep.get("obs_ws_port", 4455)
         try:
             to = aiohttp.ClientTimeout(total=0.6, connect=0.4)
             async with aiohttp.ClientSession(timeout=to) as session:
@@ -420,7 +425,7 @@ class LiveStreamAPIService:
             import urllib.parse
             parsed = urllib.parse.urlparse(ep['obs_agent_url'])
             host = parsed.hostname or "159.69.64.80"
-            st = await cls._get_obs_status_direct(host, 4455, creator_clean)
+            st = await cls._get_obs_status_direct(host, obs_port, creator_clean)
             if st.get("is_connected"):
                 return {"flipped_h": st.get("flipped_h", False), "flipped_v": st.get("flipped_v", False)}
         except Exception:
@@ -466,12 +471,12 @@ class LiveStreamAPIService:
         except Exception:
             pass
 
-        # 2. Resilient Direct Fallback: Direct OBS WebSocket (port 4455 on VPS) using pure aiohttp
+        # 2. Resilient Direct Fallback: Direct OBS WebSocket using pure aiohttp
         try:
             import urllib.parse
             parsed = urllib.parse.urlparse(ep['obs_agent_url'])
             host = parsed.hostname or "159.69.64.80"
-            port = 4455
+            port = ep.get("obs_ws_port", 4455)
             current_state = getattr(cls, f"_obs_preview_{creator_clean}", True)
             target_state = (not current_state) if enable is None else bool(enable)
             hotkey = "OBSBasic.EnablePreview" if target_state else "OBSBasic.DisablePreview"
@@ -865,24 +870,36 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
 
         is_connected = status_data.get("is_connected", False)
         active_video = status_data.get("active_video") or status_data.get("input_name", "No Media Active")
-        if active_video and active_video not in ["No Media Active", "Media"]:
+        
+        # Strictly isolate models: Only cache and include active_video if OBS is connected for this creator
+        if is_connected and active_video and active_video not in ["No Media Active", "Media"]:
             LiveStreamAPIService.add_video_to_cache(self.selected_creator, active_video)
             if active_video not in videos:
                 videos.insert(0, active_video)
-        dur_sec = status_data.get("duration_sec", 0.0)
-        rem_sec = status_data.get("remaining_sec", 0.0)
+        elif not is_connected:
+            active_video = "No Media Active"
+
+        dur_sec = float(status_data.get("duration_sec", 0.0) or 0.0) if is_connected else 0.0
+        rem_sec = float(status_data.get("remaining_sec", 0.0) or 0.0) if is_connected else 0.0
         state_str = status_data.get("state", "OFFLINE")
-        flipped_h = status_data.get("flipped_h", False)
-        flipped_v = status_data.get("flipped_v", False)
+        flipped_h = status_data.get("flipped_h", False) if is_connected else False
+        flipped_v = status_data.get("flipped_v", False) if is_connected else False
         obs_preview_enabled = status_data.get("obs_preview_enabled", getattr(LiveStreamAPIService, f"_obs_preview_{self.selected_creator}", True))
 
         # Format timers
         dur_fmt = f"{int(dur_sec // 60):02d}:{int(dur_sec % 60):02d}"
         rem_fmt = f"{int(rem_sec // 60):02d}:{int(rem_sec % 60):02d}"
-        media_info = f"`{active_video}` ({rem_fmt} left of {dur_fmt})" if dur_sec > 0 else f"`{active_video}`"
+        if is_connected and dur_sec > 0:
+            media_info = f"`{active_video}` ({rem_fmt} left of {dur_fmt})"
+        elif is_connected:
+            media_info = f"`{active_video}`"
+        else:
+            media_info = "`No Media Active`"
 
         # Format orientation
-        if flipped_h and flipped_v:
+        if not is_connected:
+            orientation_info = "N/A (OBS Offline)"
+        elif flipped_h and flipped_v:
             orientation_info = "↔️↕️ Mirrored (H+V)"
         elif flipped_h:
             orientation_info = "↔️ Flipped Horizontal"
@@ -893,7 +910,7 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
 
         obs_status = "🟢 Connected" if is_connected else "🔴 Disconnected"
         stream_status = "🟢 Streaming (Live)" if is_connected and dur_sec > 0 else "⚪ Standby"
-        preview_text = "🟢 Enabled (Rendering)" if obs_preview_enabled else "⚫ Disabled (CPU Saver)"
+        preview_text = "🟢 Enabled (Rendering)" if (is_connected and obs_preview_enabled) else ("⚫ Disabled (CPU Saver)" if is_connected else "⚪ Standby")
 
         # Build V2 Container
         container = discord.ui.Container(accent_color=discord.Color.from_str("#FF0080"))
@@ -978,6 +995,10 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
             video_select.callback = on_video_selected
             video_row.add_item(video_select)
             container.add_item(video_row)
+        else:
+            container.add_item(discord.ui.TextDisplay(
+                content=f"-# 📁 *No video clips found in `videos/{self.selected_creator}/` on VPS.*"
+            ))
 
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
