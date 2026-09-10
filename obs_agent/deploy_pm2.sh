@@ -45,18 +45,22 @@ echo -e "${YELLOW}Installing/Updating dependencies...${NC}"
 .venv/bin/pip install --retries 20 --default-timeout 100 -r requirements.txt
 
 # Start with PM2
-echo -e "\n${YELLOW}Launching OBS Agent with PM2 (Port 8080)...${NC}"
-if pm2 list | grep -q "$APP_NAME"; then
-    pm2 restart "$APP_NAME"
+echo -e "\n${YELLOW}Launching Multi-Model OBS Agents with PM2 (Ports 8081-8085)...${NC}"
+if [ -f "ecosystem.config.js" ]; then
+    pm2 start ecosystem.config.js || pm2 restart ecosystem.config.js
 else
-    pm2 start .venv/bin/python --name "$APP_NAME" -- obs_agent.py
+    if pm2 list | grep -q "$APP_NAME"; then
+        pm2 restart "$APP_NAME"
+    else
+        pm2 start .venv/bin/python --name "$APP_NAME" -- obs_agent.py
+    fi
 fi
 
 pm2 save
 
 echo -e "\n${GREEN}======================================================${NC}"
-echo -e "${GREEN}   ✅ OBS Agent is RUNNING 24/7 on Port 8080!        ${NC}"
+echo -e "${GREEN}   ✅ All 5 OBS Agents are RUNNING 24/7 on PM2!       ${NC}"
 echo -e "${GREEN}======================================================${NC}"
-echo -e "  • ${YELLOW}pm2 status${NC}           → Check status"
-echo -e "  • ${YELLOW}pm2 logs $APP_NAME${NC}    → View real-time logs"
-echo -e "  • ${YELLOW}pm2 restart $APP_NAME${NC} → Restart agent\n"
+echo -e "  • ${YELLOW}pm2 status${NC}           → Check status of all 5 agents"
+echo -e "  • ${YELLOW}pm2 logs${NC}             → View real-time logs"
+echo -e "  • ${YELLOW}pm2 restart all${NC}      → Restart all agents\n"

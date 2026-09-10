@@ -47,18 +47,6 @@ module.exports = {
       env: {
         PYTHONUNBUFFERED: "1"
       }
-    },
-    {
-      name: "obs-agent-chantalkuytmistress",
-      script: ".venv/bin/python",
-      args: "obs_agent.py --creator chantalkuytmistress --port 8085 --obs-port 4459",
-      cwd: __dirname,
-      autorestart: true,
-      max_restarts: 10,
-      restart_delay: 2000,
-      env: {
-        PYTHONUNBUFFERED: "1"
-      }
     }
   ]
 };

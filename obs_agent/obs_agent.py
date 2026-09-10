@@ -749,7 +749,7 @@ class OBSAgentManager:
         If Chrome is already running, passes target URL to the active instance and focuses window."""
         try:
             creator = self.active_creator.lower()
-            target_url = "https://f2f.com/live/"
+            target_url = f"https://f2f.com/live/?creator={creator}"
             profile_dir = os.path.expanduser(f"~/.config/chrome-profiles/{creator}")
             os.makedirs(profile_dir, exist_ok=True)
 
