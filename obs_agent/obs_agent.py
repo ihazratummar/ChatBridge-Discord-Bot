@@ -838,6 +838,122 @@ class OBSAgentManager:
         except Exception as e:
             logger.warning(f"Note on browser launch: {e}")
 
+    def focus_workspace(self, creator: str = None, workspace: int = None) -> dict:
+        """
+        Switches the active Linux X11/XFCE desktop workspace and focuses the creator's windows.
+        Default mapping:
+          Workspace 1 (index 0): xsophiex
+          Workspace 2 (index 1): chantalkuyt
+          Workspace 3 (index 2): aylen
+          Workspace 4 (index 3): zoelynn
+        """
+        target_creator = (creator or self.active_creator).lower().strip()
+        workspace_map = {
+            "xsophiex": 0,    # Workspace 1
+            "sophie": 0,
+            "zoelynn": 1,     # Workspace 2 (Zoe Lynn on Workspace 2)
+            "zoe": 1,
+            "chantalkuyt": 2, # Workspace 3
+            "chantal": 2,
+            "aylen": 3,       # Workspace 4
+        }
+
+        import subprocess
+        import platform
+
+        ws_idx = workspace
+        detected_ws = None
+        matched_wid = None
+
+        if platform.system() == "Linux":
+            env = self.get_x11_gui_env()
+            display = env.get("DISPLAY", ":10.0")
+
+            # 1. Dynamic Window & Workspace Discovery via wmctrl -l
+            try:
+                out = subprocess.check_output(["wmctrl", "-l"], env=env, text=True, timeout=2)
+                for line in out.strip().split("\n"):
+                    parts = line.split(maxsplit=3)
+                    if len(parts) >= 4:
+                        wid, w_idx, host, title = parts[0], parts[1], parts[2], parts[3].lower()
+                        # Match window by creator name
+                        is_match = (target_creator in title) or \
+                                   (target_creator == "xsophiex" and "sophie" in title) or \
+                                   (target_creator in ["zoelynn", "zoe"] and "zoe" in title) or \
+                                   (target_creator in ["chantalkuyt", "chantal"] and "chantal" in title) or \
+                                   (target_creator == "aylen" and "aylen" in title)
+                        if is_match and w_idx.lstrip("-").isdigit():
+                            detected_ws = int(w_idx)
+                            matched_wid = wid
+                            logger.info(f"🔍 [FOCUS] Auto-detected window for @{target_creator} on Workspace {detected_ws + 1} (WID: {wid}, Title: '{title[:40]}')")
+                            break
+            except Exception as e:
+                logger.debug(f"wmctrl -l error: {e}")
+
+            # Use explicit workspace -> detected workspace -> fallback map
+            if ws_idx is None:
+                ws_idx = detected_ws if detected_ws is not None else workspace_map.get(target_creator, 0)
+
+            logger.info(f"🎯 [FOCUS] Switching X11 Desktop to Workspace {ws_idx + 1} for @{target_creator}...")
+
+            # 2. Switch Desktop / Workspace via wmctrl
+            try:
+                subprocess.run(["wmctrl", "-s", str(ws_idx)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+            except Exception as e:
+                logger.debug(f"wmctrl -s note: {e}")
+
+            # 3. Supplementary workspace switch via xdotool
+            try:
+                subprocess.run(["xdotool", "set_desktop", str(ws_idx)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+            except Exception as e:
+                logger.debug(f"xdotool set_desktop note: {e}")
+
+            # 4. Focus window directly if matched
+            focused_window = False
+            if matched_wid:
+                try:
+                    res = subprocess.run(["wmctrl", "-i", "-a", matched_wid], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
+                    if res.returncode == 0:
+                        focused_window = True
+                except Exception:
+                    pass
+
+            if not focused_window:
+                window_queries = [
+                    f"Chrome ({target_creator})",
+                    f"chrome-profiles/{target_creator}",
+                    target_creator,
+                    "Google Chrome",
+                    "OBS"
+                ]
+                for query in window_queries:
+                    try:
+                        res = subprocess.run(["wmctrl", "-a", query], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
+                        if res.returncode == 0:
+                            focused_window = True
+                            break
+                    except Exception:
+                        pass
+
+            return {
+                "success": True,
+                "workspace": ws_idx + 1,
+                "workspace_index": ws_idx,
+                "creator": target_creator,
+                "window_focused": focused_window,
+                "display": display,
+                "auto_detected": detected_ws is not None
+            }
+
+        ws_idx = ws_idx if ws_idx is not None else workspace_map.get(target_creator, 0)
+        return {
+            "success": True,
+            "workspace": ws_idx + 1,
+            "workspace_index": ws_idx,
+            "creator": target_creator,
+            "note": "Workspace simulated on non-Linux environment"
+        }
+
     def trigger_go_live(self, title: str = "", message: str = "", tip_goal: str = ""):
         self.ensure_browser_open()
         try:
@@ -1159,6 +1275,23 @@ async def handle_obs_preview_status(request):
     res = agent.get_obs_preview_status()
     return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
 
+async def handle_focus_workspace(request):
+    data = {}
+    if request.can_read_body:
+        try:
+            data = await request.json()
+        except Exception:
+            pass
+    if not data:
+        data = dict(request.query)
+
+    creator = data.get("creator") or request.query.get("creator") or agent.active_creator
+    workspace = data.get("workspace") or request.query.get("workspace")
+    ws_val = int(workspace) - 1 if workspace is not None and str(workspace).isdigit() else None
+
+    res = agent.focus_workspace(creator=creator, workspace=ws_val)
+    return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
+
 def init_app():
     app = web.Application()
     app.cleanup_ctx.append(start_background_tasks)
@@ -1185,6 +1318,10 @@ def init_app():
     app.router.add_post("/api/stream/end", handle_end_stream)
     app.router.add_post("/api/virtual-cam/start", handle_virtual_cam_start)
     app.router.add_post("/api/virtual-cam/stop", handle_virtual_cam_stop)
+    app.router.add_post("/api/workspace/focus", handle_focus_workspace)
+    app.router.add_get("/api/workspace/focus", handle_focus_workspace)
+    app.router.add_post("/api/focus", handle_focus_workspace)
+    app.router.add_get("/api/focus", handle_focus_workspace)
     app.router.add_post("/api/send-chat", handle_send_chat)
     app.router.add_post("/api/stream/send-chat", handle_send_chat)
     app.router.add_post("/api/stream/delete-chat", handle_delete_chat)

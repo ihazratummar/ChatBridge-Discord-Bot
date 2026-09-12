@@ -737,6 +737,28 @@ class LiveStreamAPIService:
             except Exception as e:
                 return {"success": False, "error": str(e)}
 
+    @classmethod
+    async def focus_workspace(cls, creator: str, workspace: Optional[int] = None) -> Dict:
+        """Requests VPS OBS Agent to switch Linux XFCE desktop workspace and focus the model's screen."""
+        clean_creator = creator.lower().replace("@", "").strip()
+        ep = cls.get_endpoints(clean_creator)
+        base_url = ep.get("obs_agent_url", "http://159.69.64.80:8080")
+
+        urls = [f"{base_url}/api/focus", f"http://127.0.0.1:8080/api/focus"]
+        payload = {"creator": clean_creator}
+        if workspace is not None:
+            payload["workspace"] = workspace
+
+        for url in urls:
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4.0)) as session:
+                    async with session.post(url, json=payload) as resp:
+                        if resp.status == 200:
+                            return await resp.json()
+            except Exception:
+                continue
+        return {"success": False, "error": f"Could not contact OBS Agent for @{clean_creator}"}
+
 
 class GoLiveModal(discord.ui.Modal):
     def __init__(self, creator: str, on_success_callback):
@@ -1060,6 +1082,28 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
             await interaction.response.send_modal(modal)
         settings_btn.callback = on_settings
         actions_row.add_item(settings_btn)
+
+        # [ 🎯 Focus Screen ] Button (Switches Linux desktop workspace for Discord stream)
+        focus_btn = discord.ui.Button(
+            label="Focus Screen",
+            style=discord.ButtonStyle.primary,
+            emoji="🎯",
+            custom_id="btn_focus_workspace"
+        )
+        async def on_focus(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            res = await LiveStreamAPIService.focus_workspace(self.selected_creator)
+            if res.get("success"):
+                ws_num = res.get("workspace", "?")
+                await interaction.followup.send(
+                    f"🎯 **Switched Linux Screen & Focused @{self.selected_creator} (Workspace {ws_num})!**\n"
+                    f"-# Discord full-screen stream will now display @{self.selected_creator}'s active desktop.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(f"❌ Failed to focus screen: {res.get('error')}", ephemeral=True)
+        focus_btn.callback = on_focus
+        actions_row.add_item(focus_btn)
 
         # ── OBS Controls ActionRow ──
         obs_row = discord.ui.ActionRow()
@@ -1642,6 +1686,47 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
             await ctx.send(f"🌐 **Opened / Navigated Google Chrome to F2F Live page for @{creator_clean}!**")
         else:
             await ctx.send(f"❌ Failed to open browser: {res.get('error', 'Unknown error')}")
+
+    @commands.command(name="focus", aliases=["workspace", "ws", "screen"])
+    async def prefix_focus_workspace(self, ctx: commands.Context, target: Optional[str] = None):
+        """
+        Prefix command: !focus [model or workspace 1-4]
+        Switches the Linux desktop workspace and focuses the creator's screen for Discord screen share.
+        Examples:
+          !focus chantalkuyt  -> Switch to Chantal's workspace (Workspace 2)
+          !focus sophie       -> Switch to Sophie's workspace (Workspace 1)
+          !focus aylen        -> Switch to Aylen's workspace (Workspace 3)
+          !focus zoelynn      -> Switch to Zoe Lynn's workspace (Workspace 4)
+          !focus 1            -> Switch directly to Workspace 1
+          !focus 2            -> Switch directly to Workspace 2
+        """
+        target_str = (target or self.selected_creator or "xsophiex").lower().replace("@", "").strip()
+        workspace_num = None
+        creator = target_str
+
+        # If user passed a number (e.g. !focus 2 or !ws 1)
+        if target_str.isdigit():
+            workspace_num = int(target_str)
+            num_to_creator = {1: "xsophiex", 2: "zoelynn", 3: "chantalkuyt", 4: "aylen"}
+            creator = num_to_creator.get(workspace_num, self.selected_creator)
+        else:
+            creator_aliases = {
+                "sophie": "xsophiex",
+                "chantal": "chantalkuyt",
+                "zoe": "zoelynn",
+                "mistress": "chantalkuytmistress"
+            }
+            creator = creator_aliases.get(target_str, target_str)
+
+        res = await LiveStreamAPIService.focus_workspace(creator=creator, workspace=workspace_num)
+        if res.get("success"):
+            ws = res.get("workspace", "?")
+            await ctx.send(
+                f"🎯 **Switched Linux Screen & Focused @{creator} (Workspace {ws})!**\n"
+                f"-# Discord screen share will now broadcast @{creator}'s workspace."
+            )
+        else:
+            await ctx.send(f"❌ Failed to focus workspace: {res.get('error', 'Unknown error')}")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
