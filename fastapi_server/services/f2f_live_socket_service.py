@@ -357,8 +357,12 @@ class F2FLiveSocketClient:
                     user_obj = item.get("user") or {}
                     username = (
                         (user_obj.get("display_name") if isinstance(user_obj, dict) else None) or 
-                        (user_obj.get("username") if isinstance(user_obj, dict) else None) or 
+                        (user_obj.get("name") if isinstance(user_obj, dict) else None) or 
+                        (user_obj.get("nickname") if isinstance(user_obj, dict) else None) or 
                         item.get("display_name") or 
+                        item.get("name") or 
+                        (user_obj.get("username") if isinstance(user_obj, dict) else None) or 
+                        item.get("username") or 
                         "Fan"
                     )
                     tip_amount = item.get("amount") or item.get("tip_amount") or 0
@@ -392,7 +396,16 @@ class F2FLiveSocketClient:
 
                 # Case B: Tip Received Event
                 elif "tip" in event_name and item:
-                    tip_user = item.get("username") or item.get("display_name") or "Fan"
+                    u_dict = item.get("user") or {}
+                    tip_user = (
+                        (u_dict.get("display_name") if isinstance(u_dict, dict) else None) or
+                        (u_dict.get("name") if isinstance(u_dict, dict) else None) or
+                        item.get("display_name") or 
+                        item.get("name") or 
+                        item.get("username") or 
+                        (u_dict.get("username") if isinstance(u_dict, dict) else None) or 
+                        "Fan"
+                    )
                     tip_amt = item.get("amount") or item.get("total_tip_revenue") or 0
                     self.chat_seq_counter += 1
                     

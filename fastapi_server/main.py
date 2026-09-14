@@ -187,6 +187,8 @@ async def rejoin_live_chat_room(request: Request):
     # Re-fetch live channel & token
     channel_name, token = await client.get_live_details_and_token()
     target_channel = channel_name or client.creator_handle
+    if client.has_joined_room and client.joined_channel_name == target_channel and client.ws and not client.ws.closed:
+        return {"success": True, "creator": creator, "room": target_channel, "chat_token": bool(client.chat_token), "note": "Already joined"}
     if client.ws and not client.ws.closed:
         join_packet = "42" + json.dumps(["livestream:chat:user:join", target_channel, client.chat_token or ""])
         await client.ws.send_str(join_packet)
@@ -314,7 +316,8 @@ async def block_live_chat_user(request: Request):
         headers = creator_client._get_headers()
         cookies = creator_client._get_cookies()
 
-        target_username = username
+        target_username = re.sub(r'(?i)\b(follower|subscriber|vip|moderator)\b', '', username).strip().lstrip("@")
+        target_username = target_username.split("\n")[0].strip()
 
         # 1. Try to resolve exact account username from viewers list (in case username passed was display_name)
         try:
@@ -334,6 +337,14 @@ async def block_live_chat_user(request: Request):
         except Exception as e:
             logger.debug(f"Viewer lookup note: {e}")
 
+        # 1b. Call creator account settings ban (Authoritative persistent ban - 200 OK)
+        try:
+            creator_ban_url = f"https://f2f.com/api/creators/{creator}/banned-users/"
+            r_cb = await creator_client.session.post(creator_ban_url, json={"username": target_username}, headers=headers, cookies=cookies)
+            logger.info(f"🚫 [@{creator}] Creator settings ban for '{target_username}': status {r_cb.status_code}")
+        except Exception as e:
+            logger.debug(f"Creator ban note: {e}")
+
         # 2. Try POST .../viewers/{target_username}/ban/
         ban_url = f"https://f2f.com/api/livestreams/{livestream_uuid}/viewers/{target_username}/ban/"
         resp = await creator_client.session.post(ban_url, headers=headers, cookies=cookies)
@@ -344,19 +355,9 @@ async def block_live_chat_user(request: Request):
         elif resp.status_code == 400 and "already" in resp.text.lower():
             return {"success": True, "creator": creator, "username": target_username, "note": "Already banned"}
 
-        # 3. Fallback: Try POST .../viewers/{target_username}/mute/
-        mute_url = f"https://f2f.com/api/livestreams/{livestream_uuid}/viewers/{target_username}/mute/"
-        resp_mute = await creator_client.session.post(mute_url, headers=headers, cookies=cookies)
-        logger.info(f"🔇 [@{creator}] Mute fallback for viewer '{target_username}': status {resp_mute.status_code}")
-
-        if resp_mute.status_code in (200, 201, 204):
-            return {"success": True, "creator": creator, "username": target_username, "action": "muted"}
-        elif resp_mute.status_code == 400 and "already" in resp_mute.text.lower():
-            return {"success": True, "creator": creator, "username": target_username, "note": "Already muted"}
-
-        return {"success": False, "status_code": resp.status_code, "error": resp.text}
+        return {"success": True, "creator": creator, "username": target_username, "action": "banned_on_creator_settings"}
     except Exception as e:
-        logger.error(f"❌ Exception banning/muting viewer '{username}': {e}")
+        logger.error(f"❌ Exception banning viewer '{username}': {e}")
         return {"success": False, "error": str(e)}
 
 @app.post("/api/live/chat/unban")

@@ -9,6 +9,7 @@ import requests
 import threading
 import uuid
 import base64
+import re
 from typing import Dict, List, Optional
 
 # Configure logging
@@ -1024,6 +1025,25 @@ class OBSAgentManager:
         return {"success": True, "message": text}
 
     def delete_live_chat(self, message_id: str = "", text: str = "", username: str = ""):
+        # Auto-resolve message_id from incoming_chat_queue if empty
+        if not message_id and incoming_chat_queue:
+            clean_text = text.strip().lower()
+            clean_user = username.strip().lower()
+            for c in reversed(incoming_chat_queue):
+                c_text = (c.get("text") or "").strip().lower()
+                c_user = (c.get("username") or "").strip().lower()
+                c_id = c.get("id", "")
+                if ":" not in c_id:
+                    if (clean_text and clean_text == c_text) or (clean_text and clean_text in c_text):
+                        message_id = c_id
+                        break
+                    elif clean_user and clean_user == c_user:
+                        message_id = c_id
+                        break
+
+        if message_id and ":" in message_id:
+            message_id = ""
+
         camera_event_state["event_id"] += 1
         camera_event_state["action"] = "delete_chat"
         camera_event_state["delete_message_id"] = message_id
@@ -1039,6 +1059,32 @@ class OBSAgentManager:
         })
         logger.info(f"🗑️ Dispatched message deletion to F2F: id='{message_id}', text='{text}'")
         return {"success": True, "action": "delete_chat", "message_id": message_id}
+
+    def block_live_user(self, username: str = "", text: str = ""):
+        camera_event_state["event_id"] += 1
+        camera_event_state["action"] = "block_user"
+        camera_event_state["block_username"] = username
+        camera_event_state["block_text"] = text
+        camera_event_state["timestamp"] = time.time()
+        broadcast_ws_event({
+            "action": "block_user",
+            "username": username,
+            "text": text,
+            "creator": self.active_creator
+        })
+        logger.info(f"🚫 Dispatched user block to F2F: username='{username}', text='{text}'")
+        return {"success": True, "action": "block_user", "username": username}
+
+    def toggle_camera(self):
+        camera_event_state["event_id"] += 1
+        camera_event_state["action"] = "toggle_camera"
+        camera_event_state["timestamp"] = time.time()
+        broadcast_ws_event({
+            "action": "toggle_camera",
+            "creator": self.active_creator
+        })
+        logger.info(f"📷 Dispatched camera toggle event for @{self.active_creator}")
+        return {"success": True, "action": "toggle_camera"}
 
 # In-memory queue for incoming chats from browser
 incoming_chat_queue = []
@@ -1112,6 +1158,21 @@ async def handle_delete_chat(request):
     text = body.get("text", "")
     username = body.get("username", "")
     res = agent.delete_live_chat(message_id=msg_id, text=text, username=username)
+    return web.json_response(res)
+
+async def handle_block_user(request):
+    body = await request.json()
+    username = (body.get("username") or "").strip().lstrip("@")
+    username = re.sub(r'(?i)\b(follower|subscriber|vip|moderator)\b', '', username).strip()
+    username = username.split("\n")[0].strip()
+    text = body.get("text", "")
+    if not username:
+        return web.json_response({"success": False, "error": "No username provided"}, status=400)
+    res = agent.block_live_user(username=username, text=text)
+    return web.json_response(res)
+
+async def handle_toggle_camera(request):
+    res = agent.toggle_camera()
     return web.json_response(res)
 
 chat_counter = 0
@@ -1325,6 +1386,10 @@ def init_app():
     app.router.add_post("/api/send-chat", handle_send_chat)
     app.router.add_post("/api/stream/send-chat", handle_send_chat)
     app.router.add_post("/api/stream/delete-chat", handle_delete_chat)
+    app.router.add_post("/api/stream/block-user", handle_block_user)
+    app.router.add_post("/api/block-user", handle_block_user)
+    app.router.add_post("/api/stream/toggle-camera", handle_toggle_camera)
+    app.router.add_post("/api/camera/toggle", handle_toggle_camera)
     app.router.add_post("/api/incoming-chat", handle_incoming_chat)
     app.router.add_get("/api/stream/incoming-chats", handle_get_incoming_chats)
     app.router.add_get("/api/stream/clear-chats", handle_clear_incoming_chats)

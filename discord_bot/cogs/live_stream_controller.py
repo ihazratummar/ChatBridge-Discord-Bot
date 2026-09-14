@@ -520,6 +520,21 @@ class LiveStreamAPIService:
                 return {"success": False, "error": str(e)}
 
     @classmethod
+    async def toggle_camera(cls, creator: str) -> Dict:
+        """Toggles the camera ON/OFF on F2F Live via the OBS Agent."""
+        ep = cls.get_endpoints(creator)
+        obs_agent_url = ep.get('obs_agent_url')
+        if obs_agent_url:
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.post(f"{obs_agent_url}/api/stream/toggle-camera", timeout=3) as resp:
+                        if resp.status == 200:
+                            return await resp.json()
+                except Exception as e:
+                    logger.debug(f"Failed to toggle camera via OBS Agent: {e}")
+        return {"success": False, "error": "OBS Agent unavailable"}
+
+    @classmethod
     async def toggle_fyp_loop(cls, creator: str) -> Dict:
         ep = cls.get_endpoints(creator)
         async with aiohttp.ClientSession() as session:
@@ -532,77 +547,140 @@ class LiveStreamAPIService:
     @classmethod
     async def send_live_chat(cls, creator: str, message: str) -> Dict:
         ep = cls.get_endpoints(creator)
-        async with aiohttp.ClientSession() as session:
-            # 1. Primary: Direct VPS OBS Agent (Runs in active Chrome browser with creator cookies)
-            try:
-                async with session.post(
-                    f"{ep['obs_agent_url']}/api/send-chat",
-                    json={"message": message},
-                    timeout=4
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("success"):
-                            return data
-            except Exception as e:
-                logger.warning(f"Failed dispatching chat to OBS Agent for {creator}: {e}")
+        obs_agent_url = ep.get('obs_agent_url')
+        fastapi_url = ep.get('fastapi_url', 'http://127.0.0.1:8000')
 
-            # 2. Fallback: FastAPI
-            fastapi_url = ep.get('fastapi_url', 'http://127.0.0.1:8000')
-            try:
-                async with session.post(
-                    f"{fastapi_url}/api/live/chat/send",
-                    json={"creator": creator, "message": message},
-                    timeout=4
-                ) as resp:
-                    return await resp.json()
-            except Exception as e:
-                return {"success": False, "error": str(e)}
+        async with aiohttp.ClientSession() as session:
+            # 1. Primary: Direct VPS OBS Agent -> Browser Userscript (works for camera on/off, e.g. Sophie and Aylen)
+            if obs_agent_url:
+                try:
+                    async with session.post(
+                        f"{obs_agent_url}/api/send-chat",
+                        json={"message": message},
+                        timeout=4
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("success"):
+                                return data
+                except Exception as e:
+                    logger.warning(f"Failed dispatching chat to OBS Agent for {creator}: {e}")
+
+            # 2. Fallback: FastAPI Live API
+            urls = [fastapi_url]
+            if "127.0.0.1" not in fastapi_url and "localhost" not in fastapi_url:
+                urls.append("http://127.0.0.1:8000")
+
+            for u in urls:
+                try:
+                    async with session.post(
+                        f"{u}/api/live/chat/send",
+                        json={"creator": creator, "message": message},
+                        timeout=4
+                    ) as resp:
+                        if resp.status == 200:
+                            return await resp.json()
+                except Exception:
+                    continue
+
+        return {"success": False, "error": "All live chat dispatch backends failed"}
 
     @classmethod
     async def delete_live_chat(cls, creator: str, message_id: str = "", text: str = "", username: str = "") -> Dict:
         ep = cls.get_endpoints(creator)
         fastapi_url = ep.get('fastapi_url', 'http://127.0.0.1:8000')
-        async with aiohttp.ClientSession() as session:
-            # 1. Direct FastAPI Server-to-Server Live Socket
-            try:
-                async with session.post(
-                    f"{fastapi_url}/api/live/chat/delete",
-                    json={"creator": creator, "message_id": message_id, "text": text, "username": username},
-                    timeout=3
-                ) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-            except Exception:
-                pass
+        obs_agent_url = ep.get('obs_agent_url')
 
-            # 2. Fallback to VPS OBS Agent
-            try:
-                async with session.post(
-                    f"{ep['obs_agent_url']}/api/stream/delete-chat",
-                    json={"message_id": message_id, "text": text, "username": username},
-                    timeout=3
-                ) as resp:
-                    return await resp.json()
-            except Exception as e:
-                return {"success": False, "error": str(e)}
+        async with aiohttp.ClientSession() as session:
+            # 1. Primary for active streams: Try VPS OBS Agent (authoritative for browser DOM & live WebSocket)
+            if obs_agent_url:
+                try:
+                    async with session.post(
+                        f"{obs_agent_url}/api/stream/delete-chat",
+                        json={"message_id": message_id, "text": text, "username": username},
+                        timeout=3
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("success"):
+                                logger.info(f"🗑️ [@{creator}] Deleted live chat via OBS Agent: '{text}'")
+                                return data
+                except Exception as e:
+                    logger.debug(f"OBS Agent delete attempt failed: {e}")
+
+            # 2. Server-to-Server Fallback: FastAPI Live Socket
+            urls = [fastapi_url]
+            if "127.0.0.1" not in fastapi_url and "localhost" not in fastapi_url:
+                urls.append("http://127.0.0.1:8000")
+
+            for u in urls:
+                try:
+                    async with session.post(
+                        f"{u}/api/live/chat/delete",
+                        json={"creator": creator, "message_id": message_id, "text": text, "username": username},
+                        timeout=3
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("success"):
+                                logger.info(f"🗑️ [@{creator}] Deleted live chat via FastAPI: '{text}'")
+                                return data
+                except Exception:
+                    continue
+
+        return {"success": False, "error": "All delete backends failed"}
 
     @classmethod
-    async def block_live_user(cls, creator: str, username: str) -> Dict:
+    async def block_live_user(cls, creator: str, username: str, text: str = "") -> Dict:
         ep = cls.get_endpoints(creator)
         fastapi_url = ep.get('fastapi_url', 'http://127.0.0.1:8000')
+        obs_agent_url = ep.get('obs_agent_url')
+
+        clean_user = re.sub(r'(?i)\b(follower|subscriber|vip|moderator)\b', '', username).strip().lstrip("@")
+        clean_user = clean_user.split("\n")[0].strip()
+
+        results = []
         async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(
-                    f"{fastapi_url}/api/live/chat/block",
-                    json={"creator": creator, "username": username},
-                    timeout=5
-                ) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    return {"success": False, "error": f"HTTP {resp.status}"}
-            except Exception as e:
-                return {"success": False, "error": str(e)}
+            # 1. Primary for active streams: Try VPS OBS Agent (browser DOM & WebSocket block)
+            if obs_agent_url:
+                try:
+                    async with session.post(
+                        f"{obs_agent_url}/api/stream/block-user",
+                        json={"creator": creator, "username": clean_user, "text": text},
+                        timeout=3
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("success"):
+                                logger.info(f"🚫 [@{creator}] Blocked live user via OBS Agent: @{clean_user}")
+                                results.append(data)
+                except Exception as e:
+                    logger.debug(f"OBS Agent block attempt note: {e}")
+
+            # 2. Dual-Layer: Also dispatch to FastAPI (for creator account settings ban & stream viewer ban)
+            urls = [fastapi_url]
+            if "127.0.0.1" not in fastapi_url and "localhost" not in fastapi_url:
+                urls.append("http://127.0.0.1:8000")
+
+            for u in urls:
+                try:
+                    async with session.post(
+                        f"{u}/api/live/chat/block",
+                        json={"creator": creator, "username": clean_user},
+                        timeout=4
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("success"):
+                                logger.info(f"🚫 [@{creator}] Blocked live user via FastAPI: @{clean_user}")
+                                results.append(data)
+                                break
+                except Exception:
+                    continue
+
+        if results:
+            return {"success": True, "creator": creator, "username": clean_user}
+        return {"success": False, "error": "All block backends failed"}
 
     @classmethod
     async def unban_live_user(cls, creator: str, username: str) -> Dict:
@@ -674,7 +752,29 @@ class LiveStreamAPIService:
         return {"success": False}
 
     @classmethod
-    async def get_incoming_chats(cls, creator: str, since_seq: int = 0) -> tuple:
+    async def get_obs_incoming_chats(cls, creator: str, since_seq: int = 0) -> tuple:
+        """Fetches incoming chats from the VPS OBS Agent (authoritative for OBS streams)."""
+        ep = cls.get_endpoints(creator)
+        obs_agent_url = ep.get('obs_agent_url')
+        if not obs_agent_url:
+            return [], since_seq
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(
+                    f"{obs_agent_url}/api/stream/incoming-chats?since_seq={since_seq}",
+                    timeout=3
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("chats", []), data.get("max_seq", since_seq)
+            except Exception:
+                pass
+        return [], since_seq
+
+    @classmethod
+    async def get_fastapi_incoming_chats(cls, creator: str, since_seq: int = 0) -> tuple:
+        """Fetches incoming chats from FastAPI (authoritative for non-OBS creators like Aylen)."""
         ep = cls.get_endpoints(creator)
         fastapi_url = ep.get('fastapi_url', 'http://127.0.0.1:8000')
         urls = [fastapi_url]
@@ -690,11 +790,50 @@ class LiveStreamAPIService:
                     ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            chats = data.get("chats", [])
-                            max_seq = data.get("max_seq", since_seq)
-                            return chats, max_seq
+                            return data.get("chats", []), data.get("max_seq", since_seq)
                 except Exception:
                     continue
+        return [], since_seq
+
+    @classmethod
+    async def get_incoming_chats(cls, creator: str, since_seq: int = 0) -> tuple:
+        """Authoritative live chat poller: queries VPS OBS Agent first (sub-second userscript WebSocket relay), falls back to FastAPI."""
+        ep = cls.get_endpoints(creator)
+        obs_agent_url = ep.get('obs_agent_url')
+
+        # 1. Primary: VPS OBS Agent (direct browser userscript WebSocket interceptor on VPS)
+        if obs_agent_url:
+            try:
+                to = aiohttp.ClientTimeout(total=2.5, connect=1.2)
+                async with aiohttp.ClientSession(timeout=to) as session:
+                    async with session.get(
+                        f"{obs_agent_url}/api/stream/incoming-chats?since_seq={since_seq}"
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            return data.get("chats", []), data.get("max_seq", since_seq)
+            except Exception:
+                pass
+
+        # 2. Fallback: Central FastAPI Live Socket Relay
+        fastapi_url = ep.get('fastapi_url', 'http://127.0.0.1:8000')
+        urls = [fastapi_url]
+        if "127.0.0.1" not in fastapi_url and "localhost" not in fastapi_url:
+            urls.append("http://127.0.0.1:8000")
+
+        to = aiohttp.ClientTimeout(total=2.5, connect=1.2)
+        async with aiohttp.ClientSession(timeout=to) as session:
+            for url in urls:
+                try:
+                    async with session.get(
+                        f"{url}/api/live/chat/incoming?creator={creator}&since_seq={since_seq}"
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            return data.get("chats", []), data.get("max_seq", since_seq)
+                except Exception:
+                    continue
+
         return [], since_seq
 
 
@@ -1169,6 +1308,23 @@ class F2FLiveStreamDashboardView(discord.ui.LayoutView):
         preview_btn.callback = on_toggle_preview
         obs_row.add_item(preview_btn)
 
+        # [ 📷 Toggle Camera ] Button (Turns camera OFF / ON on F2F Live)
+        cam_toggle_btn = discord.ui.Button(
+            label="Toggle Camera",
+            style=discord.ButtonStyle.secondary,
+            emoji="📷",
+            custom_id="btn_toggle_camera"
+        )
+        async def on_toggle_camera(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            res = await LiveStreamAPIService.toggle_camera(self.selected_creator)
+            if res.get("success"):
+                await interaction.followup.send(f"📷 **Toggled Camera (ON/OFF) on F2F Live for @{self.selected_creator}!**", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ Failed to toggle camera: {res.get('error')}", ephemeral=True)
+        cam_toggle_btn.callback = on_toggle_camera
+        obs_row.add_item(cam_toggle_btn)
+
         # Refresh Dashboard Button
         refresh_btn = discord.ui.Button(
             label="Refresh",
@@ -1231,29 +1387,6 @@ def save_chat_cache(cache: Dict[int, Dict]):
 DISCORD_TO_F2F_CHAT_CACHE: Dict[int, Dict] = load_chat_cache()
 
 
-class LiveChatMessageView(discord.ui.View):
-    """Interactive Components V2 View with a Delete button for F2F Live comments."""
-    def __init__(self, creator: str, f2f_id: str, text: str, username: str):
-        super().__init__(timeout=None)
-        self.creator = creator
-        self.f2f_id = f2f_id
-        self.text = text
-        self.username = username
-
-    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
-    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        res = await LiveStreamAPIService.delete_live_chat(
-            creator=self.creator,
-            message_id=self.f2f_id,
-            text=self.text,
-            username=self.username
-        )
-        try:
-            await interaction.message.delete()
-        except Exception:
-            pass
-
 
 class UnbanButtonView(discord.ui.View):
     """One-click Unban button displayed when a user is blocked from F2F Live."""
@@ -1293,6 +1426,7 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
             "aylen": -1
         }
         self.seen_message_ids = set()
+        self.seen_content_hashes = {}
         self.last_rejoin_time = {}
         self.poller_task = None
 
@@ -1303,71 +1437,109 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
         if self.poller_task and not self.poller_task.done():
             self.poller_task.cancel()
 
+    async def _poll_single_creator(self, creator: str):
+        try:
+            # Proactive Room Keepalive: Only rejoin on initial boot or if polling errored out
+            now = time.time()
+            if self.last_rejoin_time.get(creator, 0) == 0:
+                self.last_rejoin_time[creator] = now
+                asyncio.create_task(LiveStreamAPIService.rejoin_live_chat(creator))
+
+            curr_seq = self.creator_last_seq.get(creator, -1)
+            if curr_seq == -1:
+                # Initial bot boot sync: set pointer to current server head
+                initial_chats, initial_max_seq = await LiveStreamAPIService.get_incoming_chats(creator, since_seq=0)
+                self.creator_last_seq[creator] = initial_max_seq
+                logger.info(f"💬 Live chat synced to server head for @{creator} (seq #{initial_max_seq})")
+                now_ts = time.time()
+                for c in initial_chats:
+                    if now_ts - float(c.get("timestamp", 0)) < 300:
+                        await self.dispatch_chat_to_discord(creator, c)
+                return
+
+            chats, max_seq = await LiveStreamAPIService.get_incoming_chats(creator, since_seq=curr_seq)
+            if max_seq < curr_seq:
+                # Server restarted or counter reset: auto-resync immediately and fetch any new messages
+                logger.info(f"🔄 Live chat sequence reset for @{creator} ({curr_seq} -> {max_seq}). Auto-resynced.")
+                self.creator_last_seq[creator] = max_seq
+                chats, _ = await LiveStreamAPIService.get_incoming_chats(creator, since_seq=0)
+            elif max_seq > curr_seq:
+                self.creator_last_seq[creator] = max_seq
+
+            if chats:
+                for chat in chats:
+                    await self.dispatch_chat_to_discord(creator, chat)
+        except Exception as e:
+            logger.debug(f"Poller tick note for @{creator}: {e}")
+
     async def incoming_chat_poller(self):
-        """Polls active model VPS agents for incoming live chats/tips and relays them to Discord."""
+        """Polls active model agents concurrently for incoming live chats/tips and relays them to Discord."""
         await self.bot.wait_until_ready()
-        logger.info("💬 Started Two-Way F2F Live Chat background poller.")
+        logger.info("💬 Started Two-Way F2F Live Chat background poller (Concurrent Sub-Second Engine).")
+        creators = ["xsophiex", "chantalkuyt", "chantalkuytmistress", "zoelynn", "aylen"]
         while not self.bot.is_closed():
             try:
-                for creator in ["xsophiex", "chantalkuyt", "chantalkuytmistress", "zoelynn", "aylen"]:
-                    # Proactive Room Keepalive: Ensure WebSocket room subscription is ALWAYS active on stream restart
-                    now = time.time()
-                    if now - self.last_rejoin_time.get(creator, 0) > 15:
-                        self.last_rejoin_time[creator] = now
-                        asyncio.create_task(LiveStreamAPIService.rejoin_live_chat(creator))
-
-                    curr_seq = self.creator_last_seq.get(creator, -1)
-                    if curr_seq == -1:
-                        # Initial bot boot sync: set pointer to current server head
-                        initial_chats, initial_max_seq = await LiveStreamAPIService.get_incoming_chats(creator, since_seq=0)
-                        self.creator_last_seq[creator] = initial_max_seq
-                        logger.info(f"💬 Live chat synced to server head for @{creator} (seq #{initial_max_seq})")
-                        # Dispatch any fresh chats that arrived in the last 60 seconds so nothing is dropped
-                        now_ts = time.time()
-                        for c in initial_chats:
-                            if now_ts - float(c.get("timestamp", 0)) < 60:
-                                await self.dispatch_chat_to_discord(creator, c)
-                        continue
-
-                    chats, max_seq = await LiveStreamAPIService.get_incoming_chats(creator, since_seq=curr_seq)
-                    if max_seq < curr_seq:
-                        # Server restarted or counter reset: auto-resync immediately and fetch any new messages
-                        logger.info(f"🔄 Live chat sequence reset for @{creator} ({curr_seq} -> {max_seq}). Auto-resynced.")
-                        self.creator_last_seq[creator] = max_seq
-                        chats, _ = await LiveStreamAPIService.get_incoming_chats(creator, since_seq=0)
-                    elif max_seq > curr_seq:
-                        self.creator_last_seq[creator] = max_seq
-
-                    if chats:
-                        for chat in chats:
-                            await self.dispatch_chat_to_discord(creator, chat)
+                await asyncio.gather(*(self._poll_single_creator(c) for c in creators), return_exceptions=True)
             except Exception as e:
                 logger.error(f"Chat poller error: {e}")
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)
 
     async def dispatch_chat_to_discord(self, creator: str, chat: Dict):
         """Finds the correct livechat channel for the model and posts the comment with moderation Delete button."""
-        username = (chat.get("username") or "Fan").strip()
+        username = (chat.get("display_name") or chat.get("name") or chat.get("username") or "Fan").strip()
+        username = username.split("\n")[0].strip()
+        username = re.sub(r'(?i)\b(follower|subscriber|vip|moderator)\b', '', username).strip().lstrip("@")
+        if not username:
+            username = "Fan"
         text = (chat.get("text") or "").strip()
         c_type = chat.get("type", "chat")
         tip_amount = chat.get("tip_amount", 0)
 
-        # De-duplicate incoming messages across reconnects and restarts
-        f2f_id = str(chat.get("id") or f"{creator}:{username}:{text}").strip()
-        if f2f_id in self.seen_message_ids:
+        # 1. De-duplicate incoming messages by unique message ID
+        f2f_id = str(chat.get("id") or "").strip()
+        if f2f_id and f2f_id in self.seen_message_ids:
             return
-        self.seen_message_ids.add(f2f_id)
-        if len(self.seen_message_ids) > 1000:
-            self.seen_message_ids = set(list(self.seen_message_ids)[-500:])
+        if f2f_id:
+            self.seen_message_ids.add(f2f_id)
+            if len(self.seen_message_ids) > 1000:
+                self.seen_message_ids = set(list(self.seen_message_ids)[-500:])
 
         creator_lower = creator.lower().replace("@", "")
         creator_key = creator_lower.replace("x", "") # e.g. "sophie" for "xsophiex"
 
-        # 1. Strictly filter out joined messages, system alerts, empty content, and creator self-messages
+        # 2. Sliding window content deduplication (prevents duplicate messages from reconnects/dual-endpoints)
+        now_ts = time.time()
+        content_hash = f"{creator_lower}:{username.lower()}:{text.strip().lower()}"
+        if content_hash in self.seen_content_hashes:
+            if now_ts - self.seen_content_hashes[content_hash] < 15.0:
+                logger.info(f"🛡️ Deduplicated duplicate livechat from @{username}: '{text}'")
+                return
+        self.seen_content_hashes[content_hash] = now_ts
+        if len(self.seen_content_hashes) > 500:
+            self.seen_content_hashes = {k: v for k, v in self.seen_content_hashes.items() if now_ts - v < 60.0}
+
+        # 1. Strictly filter out creator self-messages, joined alerts, and multi-line garbage
+        u_clean = username.lower().replace("@", "").replace("❤️", "").strip()
+        creator_names = {
+            "xsophiex": ["xsophiex", "sophie", "sophie ❤️", "sophiex"],
+            "chantalkuyt": ["chantalkuyt", "chantal", "chantal kuyt"],
+            "chantalkuytmistress": ["chantalkuytmistress", "chantal mistress", "mistress"],
+            "zoelynn": ["zoelynn", "zoe", "zoe lynn"],
+            "aylen": ["aylen"]
+        }
+        known_aliases = creator_names.get(creator_lower, [creator_lower])
+        is_creator_msg = any(alias in u_clean or u_clean in alias for alias in known_aliases)
+        recent_discord_sent = f"{creator_lower}:{text.strip().lower()}" in self.seen_content_hashes
+
         if (
-            c_type in ["joined", "left", "system"] or
+            is_creator_msg or
+            recent_discord_sent or
+            c_type in ["joined", "left", "system", "log"] or
             "joined" in text.lower() or
             "joined" in username.lower() or
+            "new messages" in text.lower() or
+            "tipmenu" in text.lower() or
+            len(text.split("\n")) > 2 or
             not text or
             len(text) < 1 or
             username.lower() == creator_lower or
@@ -1382,48 +1554,60 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
 
         # 2. Find model livechat channel (Strictly targets #💬-livechat in Model's LIVE category!)
         target_channel = None
-        model_keys = {
-            "xsophiex": ["sophie"],
-            "chantalkuyt": ["chantal"],
-            "chantalkuytmistress": ["mistress"],
-            "zoelynn": ["zoe"],
-            "aylen": ["aylen"]
-        }.get(creator_lower, [creator_key])
+        CHANNEL_MODEL_TO_ID = {
+            "xsophiex": 1544005198710575136,
+            "chantalkuyt": 1544075241762852874,
+            "chantalkuytmistress": 1544075999635836999,
+            "zoelynn": 1544075668793327758,
+            "aylen": 1544076264053407835,
+        }
+        known_id = CHANNEL_MODEL_TO_ID.get(creator_lower)
+        if known_id:
+            target_channel = self.bot.get_channel(known_id)
 
-        for guild in self.bot.guilds:
-            # Pass 1: Strict match - 'livechat' in channel name AND model in category (excludes Sniper Bot)
-            for channel in guild.text_channels:
-                cat_name = (channel.category.name.lower() if channel.category else "")
-                ch_name = channel.name.lower()
+        if not target_channel:
+            model_keys = {
+                "xsophiex": ["sophie"],
+                "chantalkuyt": ["chantal"],
+                "chantalkuytmistress": ["mistress"],
+                "zoelynn": ["zoe"],
+                "aylen": ["aylen"]
+            }.get(creator_lower, [creator_key])
 
-                if "sniper" in cat_name:
-                    continue
-
-                if "livechat" in ch_name:
-                    if creator_lower == "chantalkuytmistress" and "mistress" in cat_name:
-                        target_channel = channel
-                        break
-                    elif creator_lower == "chantalkuyt" and "chantal" in cat_name and "mistress" not in cat_name:
-                        target_channel = channel
-                        break
-                    elif any(k in cat_name for k in model_keys):
-                        target_channel = channel
-                        break
-            if target_channel:
-                break
-
-            # Pass 2: Fallback to any channel with livechat and model
-            if not target_channel:
+            for guild in self.bot.guilds:
+                # Pass 1: Strict match - 'livechat' in channel name AND model in category (excludes Sniper Bot)
                 for channel in guild.text_channels:
                     cat_name = (channel.category.name.lower() if channel.category else "")
                     ch_name = channel.name.lower()
+
                     if "sniper" in cat_name:
                         continue
-                    if "livechat" in ch_name and any(k in f"{cat_name} {ch_name}" for k in model_keys):
-                        target_channel = channel
-                        break
+
+                    if "livechat" in ch_name:
+                        if creator_lower == "chantalkuytmistress" and "mistress" in cat_name:
+                            target_channel = channel
+                            break
+                        elif creator_lower == "chantalkuyt" and "chantal" in cat_name and "mistress" not in cat_name:
+                            target_channel = channel
+                            break
+                        elif any(k in cat_name for k in model_keys):
+                            target_channel = channel
+                            break
                 if target_channel:
                     break
+
+                # Pass 2: Fallback to any channel with livechat and model
+                if not target_channel:
+                    for channel in guild.text_channels:
+                        cat_name = (channel.category.name.lower() if channel.category else "")
+                        ch_name = channel.name.lower()
+                        if "sniper" in cat_name:
+                            continue
+                        if "livechat" in ch_name and any(k in f"{cat_name} {ch_name}" for k in model_keys):
+                            target_channel = channel
+                            break
+                    if target_channel:
+                        break
 
         if not target_channel:
             logger.warning(f"⚠️ Could not find Discord livechat channel for creator: @{creator}")
@@ -1432,48 +1616,47 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
         try:
             logger.info(f"📨 [@{creator}] Relaying F2F chat from '{username}' into Discord #{target_channel.name}: '{text}'")
             f2f_id = chat.get("id", "")
-            view = LiveChatMessageView(creator=creator, f2f_id=f2f_id, text=text, username=username)
 
             # Only format as TIP ALERT if it is a genuine tip with an actual amount
             is_genuine_tip = (c_type == "tip" or tip_amount > 0) and ("€" in text and "/ 0" not in text)
 
             if is_genuine_tip:
-                msg = await target_channel.send(f"💸 **[TIP ALERT] {username}** tipped! `{text}`")
+                embed = discord.Embed(
+                    title=f"💸 Tip Alert (€{tip_amount})",
+                    description=f"**{username}** tipped **€{tip_amount}**!\n> {text}",
+                    color=discord.Color.gold(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                msg_obj = await target_channel.send(embed=embed)
             else:
-                msg = await target_channel.send(f"💬 **[{username}]**: {text}")
+                msg_obj = await target_channel.send(f"💬 **[{username}]**: {text}")
 
-            # Add clean emoji reaction buttons (🗑️ to delete, 🚫 to block user)
-            try:
-                await msg.add_reaction("🗑️")
-                await msg.add_reaction("🚫")
-            except Exception:
-                pass
+            # Add moderation reaction emojis: 🗑️ (Delete comment) & 🚫 (Ban user)
+            if msg_obj:
+                try:
+                    await msg_obj.add_reaction("🗑️")
+                    await msg_obj.add_reaction("🚫")
+                except Exception:
+                    pass
 
-            # Store in cache for 🗑️ / 🚫 reaction handling
-            DISCORD_TO_F2F_CHAT_CACHE[msg.id] = {
-                "f2f_id": f2f_id,
-                "creator": creator,
-                "username": username,
-                "text": text
-            }
-            save_chat_cache(DISCORD_TO_F2F_CHAT_CACHE)
+            # Save mapping in global cache
+            if msg_obj:
+                DISCORD_TO_F2F_CHAT_CACHE[msg_obj.id] = {
+                    "f2f_id": f2f_id,
+                    "creator": creator,
+                    "username": username,
+                    "text": text
+                }
+                save_chat_cache(DISCORD_TO_F2F_CHAT_CACHE)
         except Exception as e:
-            logger.error(f"Error dispatching chat to Discord channel: {e}")
+            logger.error(f"Failed to post incoming livechat to #{target_channel.name}: {e}")
 
     async def resolve_chat_info(self, channel_id: int, message_id: int) -> Optional[Dict]:
-        """
-        Decade-Proof chat info resolver:
-        1. Checks in-memory and persistent JSON disk cache.
-        2. If missing (e.g. after bot restart, offline for months/years, or fresh machine),
-           fetches the Discord message directly from Discord API and parses:
-           - Creator model (from channel name, category, and guild layout)
-           - Chatter username & text (from message formatting)
-        """
-        # 1. Check in-memory / disk cache
-        if message_id in DISCORD_TO_F2F_CHAT_CACHE:
-            return DISCORD_TO_F2F_CHAT_CACHE.get(message_id)
+        """Resolves chat metadata for reaction moderation. Rejects sniper channels."""
+        cached = DISCORD_TO_F2F_CHAT_CACHE.get(message_id)
+        if cached:
+            return cached
 
-        # 2. Decade-Proof Fallback: Fetch message directly from Discord
         channel = self.bot.get_channel(channel_id)
         if not channel:
             try:
@@ -1484,14 +1667,18 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
         if not channel:
             return None
 
+        # Ignore anything in sniper category or channel
+        category_name = (channel.category.name.lower() if channel.category else "")
+        channel_name = channel.name.lower().replace("-", "").replace("_", "")
+        if "sniper" in category_name or "sniper" in channel_name:
+            return None
+
         try:
             msg = await channel.fetch_message(message_id)
         except Exception:
             return None
 
         # Determine creator from channel & category
-        category_name = (channel.category.name.lower() if channel.category else "")
-        channel_name = channel.name.lower().replace("-", "").replace("_", "")
         combined = f"{category_name} {channel_name}"
 
         creator = "xsophiex"
@@ -1511,21 +1698,24 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
         username = ""
         text = ""
 
-        # Check Relayed Chat: 💬 **[username]**: text or 💬 **username**: text
-        m_chat = re.search(r"💬\s*\*\*\[?(.*?)\]?\*\*:\s*([\s\S]*)", content)
+        # Check Relayed Chat: 💬 **[username]**: text or 💬 [username]: text or 💬 username: text
+        m_chat = re.search(r"💬\s*\*?\*?\[?(.*?)\]?\*?\*?:\s*([\s\S]*)", content)
         if m_chat:
-            username = m_chat.group(1).strip("[] ")
+            username = m_chat.group(1).strip("[]* ")
+            username = re.sub(r'(?i)\b(follower|subscriber|vip|moderator)\b', '', username).strip().lstrip("@")
             text = m_chat.group(2).strip()
         else:
             # Check Tip Alert: 💸 **[TIP ALERT] username** tipped! `text`
             m_tip = re.search(r"💸\s*\*\*\[TIP ALERT\]\s*(.*?)\*\*\s*tipped!(?:\s*`?(.*?)`?\s*$)?", content)
             if m_tip:
                 username = m_tip.group(1).strip("[] ")
+                username = re.sub(r'(?i)\b(follower|subscriber|vip|moderator)\b', '', username).strip().lstrip("@")
                 text = (m_tip.group(2) or "").strip("` ")
             else:
                 # Direct chatter message typed in Discord
                 if not msg.author.bot:
                     username = msg.author.display_name or msg.author.name
+                    username = re.sub(r'(?i)\b(follower|subscriber|vip|moderator)\b', '', username).strip().lstrip("@")
                     text = content
                 else:
                     text = content
@@ -1687,6 +1877,16 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
         else:
             await ctx.send(f"❌ Failed to open browser: {res.get('error', 'Unknown error')}")
 
+    @commands.command(name="cam", aliases=["camera", "camoff", "togglecam"])
+    async def prefix_toggle_camera(self, ctx: commands.Context, model: Optional[str] = None):
+        """Prefix command: !cam [model] - Toggles the camera ON/OFF in F2F Live"""
+        creator_clean = (model or self.selected_creator or "xsophiex").lower().replace("@", "").strip()
+        res = await LiveStreamAPIService.toggle_camera(creator=creator_clean)
+        if res.get("success"):
+            await ctx.send(f"📷 **Toggled Camera (ON/OFF) on F2F Live for @{creator_clean}!**")
+        else:
+            await ctx.send(f"❌ Failed to toggle camera: {res.get('error', 'Unknown error')}")
+
     @commands.command(name="focus", aliases=["workspace", "ws", "screen"])
     async def prefix_focus_workspace(self, ctx: commands.Context, target: Optional[str] = None):
         """
@@ -1732,7 +1932,8 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
     async def on_message(self, message: discord.Message):
         """
         Auto-relays chatter messages from model channels directly into F2F Live!
-        Works with both channel names (#xsophiex) and category layouts (Sophie LIVE -> #💬-livechat).
+        Strictly restricted to #💬-livechat under each model's LIVE category.
+        Completely ignores all channels under Sniper Bot.
         """
         if message.author.bot or not message.guild:
             return
@@ -1741,18 +1942,10 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
         channel_name = message.channel.name.lower().replace("-", "").replace("_", "")
         combined = f"{category_name} {channel_name}"
 
-        # Match model by category or channel name
-        target_model = None
-        if "sophie" in combined:
-            target_model = "xsophiex"
-        elif "chantalkuytmistress" in combined or "mistress" in combined:
-            target_model = "chantalkuytmistress"
-        elif "chantal" in combined:
-            target_model = "chantalkuyt"
-        elif "zoelynn" in combined or "zoe" in combined:
-            target_model = "zoelynn"
-        elif "aylen" in combined:
-            target_model = "aylen"
+        # 🛑 STRICT GUARD: Ignore ALL messages from Sniper Bot category or sniper channels!
+        # Sniper Bot channels (e.g. #xsophiex, #aylen under Sniper Bot) must NEVER relay to F2F Live.
+        if "sniper" in category_name or "sniper" in channel_name:
+            return
 
         # Direct in-channel !unban command support (Works in ANY channel!)
         content_stripped = message.content.strip()
@@ -1761,7 +1954,20 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
             parts = content_stripped.split()
             if len(parts) >= 2:
                 unban_target = parts[1].lstrip("@")
-                model_to_unban = parts[2].lstrip("@").lower() if len(parts) >= 3 else (target_model or "xsophiex")
+                model_to_unban = parts[2].lstrip("@").lower() if len(parts) >= 3 else None
+                if not model_to_unban:
+                    if "mistress" in combined:
+                        model_to_unban = "chantalkuytmistress"
+                    elif "chantal" in combined:
+                        model_to_unban = "chantalkuyt"
+                    elif "sophie" in combined:
+                        model_to_unban = "xsophiex"
+                    elif "zoe" in combined:
+                        model_to_unban = "zoelynn"
+                    elif "aylen" in combined:
+                        model_to_unban = "aylen"
+                    else:
+                        model_to_unban = "xsophiex"
                 res = await LiveStreamAPIService.unban_live_user(creator=model_to_unban, username=unban_target)
                 if res.get("success"):
                     await message.channel.send(f"✅ **@{unban_target} has been unbanned and unmuted for @{model_to_unban}!**")
@@ -1771,16 +1977,46 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
                 await message.channel.send("⚠️ Usage: `!unban <username> [model]` (e.g. `!unban cipher` or `!unban cipher xsophiex`)")
             return
 
-        # Only relay if typed in a livechat / model channel and not a bot command
+        # STRICT TARGET CHANNEL VERIFICATION FOR LIVE CHAT RELAY:
+        # Outgoing chat MUST only dispatch from dedicated #💬-livechat under Model's LIVE category
+        CHANNEL_ID_TO_MODEL = {
+            1544005198710575136: "xsophiex",
+            1544075241762852874: "chantalkuyt",
+            1544075999635836999: "chantalkuytmistress",
+            1544075668793327758: "zoelynn",
+            1544076264053407835: "aylen",
+        }
+
+        target_model = CHANNEL_ID_TO_MODEL.get(message.channel.id)
+
+        if not target_model:
+            # Fallback by name: Channel MUST be a livechat channel AND category MUST be a LIVE category
+            is_livechat_name = "livechat" in channel_name
+            is_live_category = "live" in category_name or "stream" in category_name
+
+            if is_livechat_name and is_live_category:
+                if "mistress" in combined:
+                    target_model = "chantalkuytmistress"
+                elif "chantal" in combined:
+                    target_model = "chantalkuyt"
+                elif "sophie" in combined:
+                    target_model = "xsophiex"
+                elif "zoe" in combined:
+                    target_model = "zoelynn"
+                elif "aylen" in combined:
+                    target_model = "aylen"
+
+        # If not a verified livechat channel, DO NOT relay to F2F Live!
         if not target_model:
             return
 
-        is_livechat_channel = "livechat" in channel_name or "chat" in channel_name or target_model in channel_name
-        if is_livechat_channel and not message.content.startswith(("/", "!", ".")):
+        # Only relay ordinary chatter messages (not bot commands)
+        if not message.content.startswith(("/", "!", ".")):
             res = await LiveStreamAPIService.send_live_chat(target_model, message.content)
             if res.get("success"):
                 try:
                     await message.add_reaction("📡")
+                    await message.add_reaction("🗑️")
                     # Store mapping so chatters can delete their own message if they make a typo!
                     DISCORD_TO_F2F_CHAT_CACHE[message.id] = {
                         "f2f_id": "",
@@ -1789,6 +2025,8 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
                         "text": message.content
                     }
                     save_chat_cache(DISCORD_TO_F2F_CHAT_CACHE)
+                    # Register sent content hash so incoming echoes are immediately suppressed
+                    self.seen_content_hashes[f"{target_model.lower()}:{message.content.strip().lower()}"] = time.time()
                 except Exception:
                     pass
             else:
@@ -1809,7 +2047,7 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
         emoji_name = str(payload.emoji.name)
         
         # 1. DELETE MESSAGE ON F2F & DISCORD
-        if emoji_name in ["🗑️", "🗑", "❌"]:
+        if "🗑" in emoji_name or emoji_name in ["❌", "\U0001f5d1"]:
             chat_info = await self.resolve_chat_info(payload.channel_id, payload.message_id)
             DISCORD_TO_F2F_CHAT_CACHE.pop(payload.message_id, None)
             save_chat_cache(DISCORD_TO_F2F_CHAT_CACHE)
@@ -1817,8 +2055,8 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
             if chat_info:
                 creator = chat_info.get("creator", "xsophiex")
                 f2f_id = chat_info.get("f2f_id", "")
-                text = chat_info.get("text", "")
-                username = chat_info.get("username", "")
+                text = (chat_info.get("text", "") or "").split("\n")[0].strip()
+                username = (chat_info.get("username", "") or "").strip().lstrip("@")
 
                 await LiveStreamAPIService.delete_live_chat(
                     creator=creator,
@@ -1841,7 +2079,7 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
                     pass
 
         # 2. BLOCK / BAN USER FROM F2F LIVE STREAM
-        elif emoji_name in ["🚫", "⛔", "🔨"]:
+        elif "🚫" in emoji_name or emoji_name in ["⛔", "🔨", "\U0001f6ab"]:
             chat_info = await self.resolve_chat_info(payload.channel_id, payload.message_id)
             DISCORD_TO_F2F_CHAT_CACHE.pop(payload.message_id, None)
             save_chat_cache(DISCORD_TO_F2F_CHAT_CACHE)
@@ -1849,17 +2087,19 @@ class LiveStreamControllerCog(commands.Cog, name="Live Stream Controller"):
             if chat_info:
                 creator = chat_info.get("creator", "xsophiex")
                 f2f_id = chat_info.get("f2f_id", "")
-                text = chat_info.get("text", "")
-                username = chat_info.get("username", "")
+                text = (chat_info.get("text", "") or "").split("\n")[0].strip()
+                username = (chat_info.get("username", "") or "").strip().lstrip("@")
 
                 # 1. Ban user on F2F Live
                 res = await LiveStreamAPIService.block_live_user(
                     creator=creator,
-                    username=username
+                    username=username,
+                    text=text
                 )
 
-                # 2. Delete the offending comment on F2F
+                # 2. Delete the offending comment on F2F (with grace delay to avoid DOM modal collision)
                 try:
+                    await asyncio.sleep(1.5)
                     await LiveStreamAPIService.delete_live_chat(
                         creator=creator,
                         message_id=f2f_id,
