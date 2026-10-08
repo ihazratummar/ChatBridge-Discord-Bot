@@ -860,11 +860,19 @@ class F2FAutomation(commands.Cog):
 
         is_valid = await self.campaign_service.f2f_client.validate_creator_exists(creator_handle)
         if not is_valid:
-            await interaction.followup.send(
-                f"❌ **Creator Not Found on F2F**: Creator **@{creator_handle}** was not found or is unauthorized on your F2F agency account.\n"
-                f"Please check that the channel name **#{interaction.channel.name}** matches the exact F2F model handle.",
-                ephemeral=True
-            )
+            status = getattr(self.campaign_service.f2f_client, "last_validation_status", 200)
+            if status == 401:
+                await interaction.followup.send(
+                    f"❌ **F2F Agency Session Expired**: Your F2F session is expired (HTTP 401).\n"
+                    f"Please update `F2F_SESSION_ID` in `discord_bot/.env` to reconnect.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"❌ **Creator Not Found on F2F**: Creator **@{creator_handle}** was not found or is unauthorized on your F2F agency account.\n"
+                    f"Please check that the channel name **#{interaction.channel.name}** matches the exact F2F model handle.",
+                    ephemeral=True
+                )
             return
 
         view = F2FForwardViewV2(

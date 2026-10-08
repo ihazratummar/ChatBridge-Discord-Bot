@@ -24,8 +24,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ChatBridge")
 
-# Load environment variables
-load_dotenv()
+# Load environment variables (override=True forces disk .env to override cached PM2 environment)
+load_dotenv(override=True)
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 if not TOKEN or TOKEN == "YOUR_DISCORD_BOT_TOKEN_HERE":

@@ -1005,6 +1005,11 @@ class OBSAgentManager:
             time.sleep(2.5)
             self.stop_virtual_cam()
             self.close_f2f_browser_tab()
+            # Cleanly reset action state back to idle so future browser opens never re-execute end_stream
+            time.sleep(2.0)
+            if camera_event_state.get("action") == "end_stream":
+                camera_event_state["action"] = "idle"
+                camera_event_state["timestamp"] = time.time()
             logger.info(f"🛑 Cleanly stopped OBS Virtual Cam and closed F2F tab for @{self.active_creator}")
 
         threading.Thread(target=delayed_stop_cam, daemon=True).start()
@@ -1102,7 +1107,25 @@ async def handle_get_config(request):
     return web.json_response(agent.config)
 
 async def handle_camera_event(request):
-    return web.json_response(camera_event_state, headers={
+    now = time.time()
+    event_timestamp = camera_event_state.get("timestamp", 0)
+    response_data = dict(camera_event_state)
+
+    # Transient actions (end_stream, go_live, toggles) expire after 15 seconds
+    # This guarantees that stale commands from past sessions are never served to freshly opened tabs
+    if (now - event_timestamp > 15.0) and response_data.get("action") not in ("none", "idle"):
+        response_data["action"] = "none"
+
+    return web.json_response(response_data, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "*"
+    })
+
+async def handle_reset_camera_event(request):
+    camera_event_state["action"] = "none"
+    camera_event_state["timestamp"] = time.time()
+    return web.json_response({"success": True, "action": "none", "event_id": camera_event_state.get("event_id", 0)}, headers={
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
         "Access-Control-Allow-Headers": "*"
@@ -1362,6 +1385,8 @@ def init_app():
     app.router.add_get("/api/status", handle_status)
     app.router.add_get("/api/config", handle_get_config)
     app.router.add_get("/api/camera-event", handle_camera_event)
+    app.router.add_post("/api/camera-event/reset", handle_reset_camera_event)
+    app.router.add_get("/api/camera-event/reset", handle_reset_camera_event)
     app.router.add_get("/api/videos", handle_list_videos)
     app.router.add_get("/api/preview", handle_preview_image)
     app.router.add_get("/api/preview.jpg", handle_preview_image)

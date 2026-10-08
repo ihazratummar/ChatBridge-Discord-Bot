@@ -26,6 +26,7 @@ class F2FClient:
         self._last_send_timestamp = 0.0
         self._last_login_timestamp = 0.0
         self._last_login_failed_at = 0.0
+        self.last_validation_status = 200
         self.event_callback = event_callback
 
     async def _notify_event(self, title: str, description: str, level: str = "info"):
@@ -58,6 +59,52 @@ class F2FClient:
         if self.csrf_token:
             headers["x-csrftoken"] = self.csrf_token
         return headers
+
+    def reload_session_from_env(self) -> bool:
+        """Reloads F2F_SESSION_ID and F2F_CSRF_TOKEN from .env file if updated on disk."""
+        try:
+            env_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+            if os.path.exists(env_file):
+                with open(env_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("F2F_SESSION_ID=") and not line.startswith("#"):
+                            new_sess = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            if new_sess and new_sess != self.session_id:
+                                logger.info(f"🔄 Detected updated F2F_SESSION_ID in .env ({new_sess[:10]}...). Reloading session!")
+                                self.session_id = new_sess
+                                return True
+                        elif line.startswith("F2F_CSRF_TOKEN=") and not line.startswith("#"):
+                            new_csrf = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            if new_csrf:
+                                self.csrf_token = new_csrf
+        except Exception as e:
+            logger.debug(f"Note on reload_session_from_env: {e}")
+        return False
+
+    def _save_session_to_env(self):
+        """Persists freshly refreshed session credentials into .env file."""
+        try:
+            env_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+            if os.path.exists(env_file):
+                with open(env_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                if "F2F_SESSION_ID=" in content:
+                    content = re.sub(r'F2F_SESSION_ID=.*', f'F2F_SESSION_ID={self.session_id}', content)
+                else:
+                    content += f"\nF2F_SESSION_ID={self.session_id}\n"
+
+                if "F2F_CSRF_TOKEN=" in content:
+                    content = re.sub(r'F2F_CSRF_TOKEN=.*', f'F2F_CSRF_TOKEN={self.csrf_token}', content)
+                else:
+                    content += f"\nF2F_CSRF_TOKEN={self.csrf_token}\n"
+
+                with open(env_file, "w", encoding="utf-8") as f:
+                    f.write(content)
+                logger.info(f"💾 Auto-saved fresh F2F_SESSION_ID ({self.session_id[:10]}...) to .env!")
+        except Exception as e:
+            logger.warning(f"Could not persist session to .env: {e}")
 
     def _get_cookies(self) -> dict:
         cookies = {}
@@ -254,6 +301,7 @@ class F2FClient:
             updated.append(f"CSRF Token: {self.csrf_token[:10]}...")
         if updated:
             logger.info(f"🍪 Extracted cookies: {' | '.join(updated)}")
+            self._save_session_to_env()
         else:
             logger.warning("⚠️ No sessionid or csrftoken found in response cookies.")
 
@@ -342,17 +390,22 @@ class F2FClient:
 
         try:
             resp = await self.session.get(url, headers=headers, cookies=cookies)
+            self.last_validation_status = resp.status_code
             if resp.status_code in (401, 403) and auto_retry:
+                if self.reload_session_from_env():
+                    return await self.validate_creator_exists(creator, auto_retry=False)
                 if await self.refresh_session():
                     return await self.validate_creator_exists(creator, auto_retry=False)
                 return False
 
             if resp.status_code == 200:
+                self.last_validation_status = 200
                 return True
             else:
                 logger.warning(f"Creator validation failed for @{creator} (HTTP {resp.status_code})")
                 return False
         except Exception as e:
+            self.last_validation_status = 500
             logger.error(f"HTTP Error validating creator @{creator}: {e}")
             return False
 
@@ -420,13 +473,18 @@ class F2FClient:
 
         try:
             resp = await self.session.get(url, headers=headers, cookies=cookies)
-            if resp.status_code in (401, 403) and auto_retry:
-                logger.warning(f"Got {resp.status_code} fetching chat {chat_id}. Attempting session refresh...")
+            if resp.status_code == 401 and auto_retry:
+                if self.reload_session_from_env():
+                    return await self.get_chat_messages(chat_id, creator, auto_retry=False)
+                logger.warning(f"Got 401 Unauthorized fetching chat {chat_id}. Attempting session refresh...")
                 if await self.refresh_session():
                     return await self.get_chat_messages(chat_id, creator, auto_retry=False)
                 else:
-                    logger.error(f"Authentication failed ({resp.status_code}) for chat {chat_id}.")
+                    logger.error(f"Authentication failed (401) for chat {chat_id}.")
                     return []
+            elif resp.status_code == 403:
+                logger.warning(f"Chat {chat_id} is restricted or permission denied (HTTP 403) for creator @{creator}.")
+                return []
 
             if resp.status_code == 200:
                 data = resp.json()
@@ -443,8 +501,10 @@ class F2FClient:
         """Translates technical HTTP status codes into friendly plain-English messages for non-developer managers."""
         if status_code == 404:
             return f"Chat UUID '{chat_id}' not found or does not belong to creator @{creator} on F2F."
-        elif status_code in (401, 403):
-            return f"F2F session expired or unauthorized for creator @{creator}."
+        elif status_code == 401:
+            return f"F2F session expired for creator @{creator}."
+        elif status_code == 403:
+            return f"Chat restricted: Fan has disabled DMs, blocked messages, or unsubscribed."
         elif status_code == 429:
             return "F2F server rate limit reached. Pacing automatically..."
         elif status_code >= 500:
@@ -478,13 +538,22 @@ class F2FClient:
                 resp = await self.session.post(url, json=payload, headers=headers, cookies=cookies)
                 self._last_send_timestamp = asyncio.get_event_loop().time()
 
-            if resp.status_code in (401, 403) and auto_retry:
-                logger.warning(f"Got {resp.status_code} sending message to {chat_id}. Attempting session refresh...")
+            if resp.status_code == 401 and auto_retry:
+                # First check if user pasted a new cookie into .env before attempting automated login
+                if self.reload_session_from_env():
+                    return await self.send_message(chat_id, creator, content, price, reply_to, auto_retry=False)
+
+                logger.warning(f"Got 401 Unauthorized sending message to {chat_id}. Attempting session refresh...")
                 if await self.refresh_session():
                     return await self.send_message(chat_id, creator, content, price, reply_to, auto_retry=False)
                 else:
-                    logger.error(f"Authentication failed ({resp.status_code}) sending message to chat {chat_id}.")
-                    return {"error": True, "reason": f"F2F login session expired for creator @{creator}.", "status_code": resp.status_code}
+                    logger.error(f"Authentication failed (401) sending message to chat {chat_id}.")
+                    return {"error": True, "reason": f"F2F login session expired for creator @{creator}.", "status_code": 401}
+            elif resp.status_code == 403:
+                # HTTP 403 on a specific message means the fan has blocked/restricted DMs. The session is still valid!
+                friendly_reason = self._format_friendly_error(403, resp.text, creator, chat_id)
+                logger.warning(f"Fan {chat_id} is restricted (HTTP 403): {friendly_reason}. Skipping fan without resetting session.")
+                return {"error": True, "reason": friendly_reason, "status_code": 403}
 
             if resp.status_code in (200, 201):
                 res_data = resp.json()

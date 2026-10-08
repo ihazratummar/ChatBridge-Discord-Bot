@@ -1097,6 +1097,12 @@
     }
 
     function executeEndStream() {
+        // STRICT SAFETY CHECK 1: Never close non-live tabs (e.g. root domain https://f2f.com/ or messages)
+        if (!pageWindow.location.pathname.startsWith("/live")) {
+            console.log("[F2F-OBS] 🛡️ Ignored end_stream: Current page is not /live (" + pageWindow.location.pathname + ")");
+            return;
+        }
+
         console.log("[F2F-OBS] 🛑 Ending current livestream from Discord...");
         hasToggledOfflineCamera = false;
         autoDismissModals();
@@ -1136,7 +1142,19 @@
                 }
             }, 200);
         } else {
-            console.log("[F2F-OBS] ℹ️ Stream is not actively broadcasting (or on setup/error screen). Closing tab immediately...");
+            // STRICT SAFETY CHECK 2: If no exit button, check if we are on the setup/idle screen (e.g. Go Live button exists)
+            // If the stream is not actively broadcasting and we are simply on the setup page, DO NOT kill the tab!
+            var isSetupScreen = pageDoc.querySelector("button[type='submit'], [class*='goLive'], [class*='startStream']") ||
+                                Array.from(pageDoc.querySelectorAll("button, div[role='button']")).some(function(b) {
+                                    var t = (b.innerText || b.textContent || "").trim().toLowerCase();
+                                    return t.includes("go live") || t.includes("live gaan") || t.includes("start broadcast");
+                                });
+            if (isSetupScreen) {
+                console.log("[F2F-OBS] 🛡️ Ignored end_stream: Tab is on the setup / pre-stream screen, keeping tab open.");
+                return;
+            }
+
+            console.log("[F2F-OBS] ℹ️ Stream is not actively broadcasting. Closing ended broadcast tab...");
             closeCurrentTab();
         }
     }
@@ -1580,8 +1598,28 @@
                     }
 
                     if (data.event_id && data.event_id !== lastProcessedEventId) {
+                        var isInitialPoll = (lastProcessedEventId === 0);
                         lastProcessedEventId = data.event_id;
-                        console.log("[F2F-OBS] 🚨 EVENT:", data.action, "event_id:", data.event_id);
+                        var nowSec = Date.now() / 1000;
+                        var eventAge = data.timestamp ? (nowSec - data.timestamp) : 0;
+
+                        // 1. Stale event protection: If the event was generated > 15 seconds ago, ignore it completely
+                        if (data.timestamp && eventAge > 15.0) {
+                            console.warn("[F2F-OBS] ⏳ Ignoring stale agent event:", data.action, "event_id:", data.event_id, "age:", Math.round(eventAge) + "s");
+                            setTimeout(pollAgentEvents, 400);
+                            return;
+                        }
+
+                        // 2. Cold-boot tab safety: If this tab just booted up, NEVER replay past end_stream, camera toggles, or idle events
+                        if (isInitialPoll) {
+                            if (data.action === "end_stream" || data.action === "none" || data.action === "idle" || eventAge > 8.0) {
+                                console.log("[F2F-OBS] 🛡️ Cold-boot tab: Synced event_id " + data.event_id + " without executing past action: " + data.action);
+                                setTimeout(pollAgentEvents, 400);
+                                return;
+                            }
+                        }
+
+                        console.log("[F2F-OBS] 🚨 EVENT:", data.action, "event_id:", data.event_id, "age:", Math.round(eventAge) + "s");
 
                         if (data.action === "turn_camera_off" || data.action === "toggle_camera") {
                             if (badge) {
